@@ -3,6 +3,7 @@ import UIKit
 
 final class KeyboardViewController: UIInputViewController {
     private let statusLabel = UILabel()
+    private let micContainer = UIView()
     private let micButton = UIButton(type: .system)
     private let globeButton = UIButton(type: .system)
     private let spaceButton = UIButton(type: .system)
@@ -32,8 +33,13 @@ final class KeyboardViewController: UIInputViewController {
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         keyboardVisible = true
-        hostBundleID = HostApplicationResolver.resolve(from: self)
+        hostBundleID = nil
         startBridgeTasks()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        resolveHostApplicationWithRetries()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -41,6 +47,8 @@ final class KeyboardViewController: UIInputViewController {
         mayAutoInsert = false
         insertionScheduledForRequestID = nil
         stopBridgeTasks()
+        HostApplicationResolver.invalidate()
+        hostBundleID = nil
         super.viewWillDisappear(animated)
     }
 
@@ -115,9 +123,19 @@ final class KeyboardViewController: UIInputViewController {
         statusLabel.numberOfLines = 2
         statusLabel.textColor = .secondaryLabel
 
+        micContainer.translatesAutoresizingMaskIntoConstraints = false
+
+        micButton.translatesAutoresizingMaskIntoConstraints = false
         micButton.titleLabel?.font = .systemFont(ofSize: 22, weight: .semibold)
         micButton.layer.cornerRadius = 24
         micButton.addTarget(self, action: #selector(microphoneTapped), for: .touchUpInside)
+        micContainer.addSubview(micButton)
+        NSLayoutConstraint.activate([
+            micButton.leadingAnchor.constraint(equalTo: micContainer.leadingAnchor),
+            micButton.trailingAnchor.constraint(equalTo: micContainer.trailingAnchor),
+            micButton.topAnchor.constraint(equalTo: micContainer.topAnchor),
+            micButton.bottomAnchor.constraint(equalTo: micContainer.bottomAnchor)
+        ])
 
         configureUtilityButton(globeButton, title: "🌐", action: #selector(globeTapped))
         configureUtilityButton(deleteButton, title: "⌫", action: #selector(deleteTapped))
@@ -131,7 +149,7 @@ final class KeyboardViewController: UIInputViewController {
         utilityRow.spacing = 8
         utilityRow.distribution = .fillProportionally
 
-        let root = UIStackView(arrangedSubviews: [statusLabel, micButton, utilityRow])
+        let root = UIStackView(arrangedSubviews: [statusLabel, micContainer, utilityRow])
         root.axis = .vertical
         root.alignment = .fill
         root.spacing = 10
@@ -144,7 +162,7 @@ final class KeyboardViewController: UIInputViewController {
             root.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
             root.topAnchor.constraint(equalTo: view.topAnchor, constant: 10),
             root.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -10),
-            micButton.heightAnchor.constraint(equalToConstant: 54),
+            micContainer.heightAnchor.constraint(equalToConstant: 54),
             utilityRow.heightAnchor.constraint(equalToConstant: 44),
             view.heightAnchor.constraint(greaterThanOrEqualToConstant: 160)
         ])
@@ -163,15 +181,40 @@ final class KeyboardViewController: UIInputViewController {
         coldHost.view.backgroundColor = .clear
         coldHost.view.isHidden = true
         addChild(coldHost)
-        view.addSubview(coldHost.view)
+        micContainer.addSubview(coldHost.view)
         NSLayoutConstraint.activate([
-            coldHost.view.leadingAnchor.constraint(equalTo: micButton.leadingAnchor),
-            coldHost.view.trailingAnchor.constraint(equalTo: micButton.trailingAnchor),
-            coldHost.view.topAnchor.constraint(equalTo: micButton.topAnchor),
-            coldHost.view.bottomAnchor.constraint(equalTo: micButton.bottomAnchor)
+            coldHost.view.leadingAnchor.constraint(equalTo: micContainer.leadingAnchor),
+            coldHost.view.trailingAnchor.constraint(equalTo: micContainer.trailingAnchor),
+            coldHost.view.topAnchor.constraint(equalTo: micContainer.topAnchor),
+            coldHost.view.bottomAnchor.constraint(equalTo: micContainer.bottomAnchor)
         ])
         coldHost.didMove(toParent: self)
         coldStartHost = coldHost
+    }
+
+    private func resolveHostApplicationWithRetries() {
+        guard keyboardVisible, viewIfLoaded?.window != nil else { return }
+
+        if let bundleID = HostApplicationResolver.resolve(from: self) {
+            hostBundleID = bundleID
+            refreshUI()
+            return
+        }
+
+        for delay in [0.15, 0.45, 0.9] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self,
+                      self.keyboardVisible,
+                      self.viewIfLoaded?.window != nil,
+                      self.hostBundleID == nil
+                else { return }
+
+                if let bundleID = HostApplicationResolver.resolve(from: self) {
+                    self.hostBundleID = bundleID
+                    self.refreshUI()
+                }
+            }
+        }
     }
 
     private func configureUtilityButton(
