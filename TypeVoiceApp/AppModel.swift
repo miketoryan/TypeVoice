@@ -74,12 +74,14 @@ final class AppModel: ObservableObject {
 
     func arm() async {
         guard apiKeyConfigured else {
+            SharedStore.clearStartRequest()
             fail("Add an OpenAI API key first.")
             return
         }
 
         let granted = await audioService.requestMicrophonePermission()
         guard granted else {
+            SharedStore.clearStartRequest()
             fail("Microphone permission is required.")
             return
         }
@@ -97,6 +99,7 @@ final class AppModel: ObservableObject {
             installExpiryTimer()
             installCommandPollTimer()
         } catch {
+            SharedStore.clearStartRequest()
             fail(error.localizedDescription)
         }
     }
