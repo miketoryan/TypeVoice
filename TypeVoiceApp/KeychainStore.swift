@@ -3,10 +3,28 @@ import Security
 
 enum KeychainStore {
     private static let service = "com.miketoryan.TypeVoice"
-    private static let account = "openai-api-key"
+    private static let chatGPTAccount = "chatgpt-codex-oauth"
 
-    static func saveAPIKey(_ value: String) throws {
-        let data = Data(value.utf8)
+    static func saveChatGPTTokens(_ tokens: ChatGPTTokens) throws {
+        let data = try JSONEncoder().encode(tokens)
+        try save(data, account: chatGPTAccount)
+    }
+
+    static func loadChatGPTTokens() -> ChatGPTTokens? {
+        guard let data = load(account: chatGPTAccount) else { return nil }
+        return try? JSONDecoder().decode(ChatGPTTokens.self, from: data)
+    }
+
+    static func deleteChatGPTTokens() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: chatGPTAccount
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+
+    private static func save(_ data: Data, account: String) throws {
         let baseQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -33,7 +51,7 @@ enum KeychainStore {
         }
     }
 
-    static func loadAPIKey() -> String? {
+    private static func load(account: String) -> Data? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -47,8 +65,7 @@ enum KeychainStore {
             SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
             let data = item as? Data
         else { return nil }
-
-        return String(data: data, encoding: .utf8)
+        return data
     }
 }
 
