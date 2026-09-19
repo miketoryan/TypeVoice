@@ -65,7 +65,10 @@ final class AudioStandbyService {
         }
 
         let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.record, mode: .measurement, options: [.allowBluetooth])
+        var options: AVAudioSession.CategoryOptions = [.mixWithOthers, .defaultToSpeaker]
+        options.insert(.allowBluetooth)
+        try session.setCategory(.playAndRecord, mode: .default, options: options)
+        try? session.setAllowHapticsAndSystemSoundsDuringRecording(true)
         try session.setActive(true)
 
         let input = engine.inputNode
