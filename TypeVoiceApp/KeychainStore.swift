@@ -1,6 +1,16 @@
 import Foundation
 import Security
 
+struct ChatGPTTokens: Codable {
+    var accessToken: String
+    var refreshToken: String
+    var idToken: String?
+    var expiresAt: Date
+    var accountID: String?
+    var email: String?
+    var plan: String?
+}
+
 enum KeychainStore {
     private static let service = "com.miketoryan.TypeVoice"
     private static let chatGPTAccount = "chatgpt-codex-oauth"
@@ -32,6 +42,7 @@ enum KeychainStore {
         ]
 
         let status = SecItemCopyMatching(baseQuery as CFDictionary, nil)
+
         if status == errSecSuccess {
             let update: [String: Any] = [kSecValueData as String: data]
             let updateStatus = SecItemUpdate(baseQuery as CFDictionary, update as CFDictionary)
@@ -42,6 +53,7 @@ enum KeychainStore {
             var addQuery = baseQuery
             addQuery[kSecValueData as String] = data
             addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+
             let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
             guard addStatus == errSecSuccess else {
                 throw KeychainError.status(addStatus)
@@ -64,7 +76,10 @@ enum KeychainStore {
         guard
             SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
             let data = item as? Data
-        else { return nil }
+        else {
+            return nil
+        }
+
         return data
     }
 }
