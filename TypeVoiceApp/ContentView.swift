@@ -108,6 +108,8 @@ struct ContentView: View {
                     }
 
                     Picker(text("待命时长", "Ready window"), selection: $quickMinutes) {
+                        Text(text("1 分钟", "1 minute")).tag(1)
+                        Text(text("5 分钟", "5 minutes")).tag(5)
                         Text(text("10 分钟", "10 minutes")).tag(10)
                         Text(text("20 分钟", "20 minutes")).tag(20)
                         Text(text("60 分钟", "60 minutes")).tag(60)
