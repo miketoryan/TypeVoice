@@ -22,7 +22,7 @@ private struct RecoveryURLLauncherView: View {
     var body: some View {
         Color.clear
             .frame(width: 1, height: 1)
-            .onChange(of: launcher.request) { _, request in
+            .onChange(of: launcher.request) { request in
                 guard let request else { return }
                 openURL(request.url)
                 launcher.request = nil
@@ -114,7 +114,9 @@ final class KeyboardViewController: UIInputViewController {
         }
 
         guard latestState.serviceReady else {
-            openContainingApp()
+            let requestID = coldStartRequestID ?? UUID().uuidString
+            coldStartRequestID = requestID
+            openContainingApp(requestID: requestID)
             return
         }
 
