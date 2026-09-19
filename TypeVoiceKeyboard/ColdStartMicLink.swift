@@ -3,6 +3,7 @@ import SwiftUI
 struct ColdStartMicLink: View {
     let isEnglish: Bool
     let hostBundleID: String?
+    let requestID: String
 
     private var destination: URL {
         var components = URLComponents()
@@ -10,7 +11,9 @@ struct ColdStartMicLink: View {
         components.host = "prepare"
 
         var items = [
-            URLQueryItem(name: "source", value: "keyboard")
+            URLQueryItem(name: "source", value: "keyboard"),
+            URLQueryItem(name: "autostart", value: "1"),
+            URLQueryItem(name: "request", value: requestID)
         ]
 
         if let hostBundleID, !hostBundleID.isEmpty {
@@ -40,8 +43,8 @@ struct ColdStartMicLink: View {
         .buttonStyle(.plain)
         .accessibilityLabel(
             isEnglish
-                ? "Open TypeVoice briefly and prepare voice dictation"
-                : "短暂打开 TypeVoice 并准备语音输入"
+                ? "Open TypeVoice briefly and start recording"
+                : "短暂打开 TypeVoice 并立即开始录音"
         )
     }
 }
