@@ -198,17 +198,13 @@ final class AppModel: ObservableObject {
             // running under the app's audio background mode.
             try? await Task.sleep(for: .milliseconds(280))
 
-            if let requestedHostBundleID,
-               !requestedHostBundleID.isEmpty {
-                _ = PreviousAppReturner.open(bundleID: requestedHostBundleID)
+            guard let requestedHostBundleID,
+                  !requestedHostBundleID.isEmpty
+            else {
+                return
             }
 
-            // FrontBoard/LaunchServices can be denied or ignored on a
-            // side-loaded build. If TypeVoice is still visibly in front after
-            // the return request, actively suspend this foreground app so iOS
-            // can reveal the previous scene instead of stranding the user here.
-            try? await Task.sleep(for: .milliseconds(520))
-            PreviousAppReturner.suspendCurrentAppIfStillForeground()
+            _ = PreviousAppReturner.open(bundleID: requestedHostBundleID)
         }
     }
 
