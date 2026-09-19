@@ -1,6 +1,35 @@
 import SwiftUI
 import UIKit
 
+@MainActor
+private final class RecoveryURLLauncher: ObservableObject {
+    struct Request: Equatable {
+        let id = UUID()
+        let url: URL
+    }
+
+    @Published var request: Request?
+
+    func open(_ url: URL) {
+        request = Request(url: url)
+    }
+}
+
+private struct RecoveryURLLauncherView: View {
+    @ObservedObject var launcher: RecoveryURLLauncher
+    @Environment(\.openURL) private var openURL
+
+    var body: some View {
+        Color.clear
+            .frame(width: 1, height: 1)
+            .onChange(of: launcher.request) { _, request in
+                guard let request else { return }
+                openURL(request.url)
+                launcher.request = nil
+            }
+    }
+}
+
 final class KeyboardViewController: UIInputViewController {
     private let statusLabel = UILabel()
     private let micContainer = UIView()
@@ -10,6 +39,8 @@ final class KeyboardViewController: UIInputViewController {
     private let deleteButton = UIButton(type: .system)
     private let returnButton = UIButton(type: .system)
     private var coldStartHost: UIHostingController<ColdStartMicLink>?
+    private let recoveryURLLauncher = RecoveryURLLauncher()
+    private var recoveryURLLauncherHost: UIHostingController<RecoveryURLLauncherView>?
 
     private let bridge = LocalBridgeClient()
 
@@ -20,6 +51,7 @@ final class KeyboardViewController: UIInputViewController {
     private var insertionScheduledForRequestID: String?
     private var hostBundleID: String?
     private var coldStartRequestID: String?
+    private var foregroundRecoveryRequestID: String?
 
     private var heartbeatTask: Task<Void, Never>?
     private var pollingTask: Task<Void, Never>?
@@ -198,6 +230,26 @@ final class KeyboardViewController: UIInputViewController {
         ])
         coldHost.didMove(toParent: self)
         coldStartHost = coldHost
+
+        // Invisible SwiftUI openURL bridge used only when a warm background
+        // microphone recovery fails. The normal cold-start button remains the
+        // existing user-tapped ColdStartMicLink above.
+        let recoveryHost = UIHostingController(
+            rootView: RecoveryURLLauncherView(launcher: recoveryURLLauncher)
+        )
+        recoveryHost.view.translatesAutoresizingMaskIntoConstraints = false
+        recoveryHost.view.backgroundColor = .clear
+        recoveryHost.view.isUserInteractionEnabled = false
+        addChild(recoveryHost)
+        view.addSubview(recoveryHost.view)
+        NSLayoutConstraint.activate([
+            recoveryHost.view.widthAnchor.constraint(equalToConstant: 1),
+            recoveryHost.view.heightAnchor.constraint(equalToConstant: 1),
+            recoveryHost.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            recoveryHost.view.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+        recoveryHost.didMove(toParent: self)
+        recoveryURLLauncherHost = recoveryHost
     }
 
     private func resolveHostApplicationWithRetries() {
@@ -219,8 +271,7 @@ final class KeyboardViewController: UIInputViewController {
             for _ in 0..<20 {
                 guard !Task.isCancelled,
                       self.keyboardVisible,
-                      self.viewIfLoaded?.window != nil,
-                      !self.latestState.serviceReady
+                      self.viewIfLoaded?.window != nil
                 else {
                     return
                 }
@@ -354,8 +405,9 @@ final class KeyboardViewController: UIInputViewController {
                 )
                 self.refreshUI()
 
-                if action == .startRecording {
-                    self.openContainingApp()
+                if action == .startRecording,
+                   let requestID {
+                    self.launchForegroundRecovery(requestID: requestID)
                 }
             }
         }
@@ -371,6 +423,7 @@ final class KeyboardViewController: UIInputViewController {
             serverID: latestState.serverID,
             revision: latestState.revision &+ 1,
             serviceReady: true,
+            microphoneReady: latestState.microphoneReady,
             status: .starting,
             requestID: requestID,
             transcribedText: nil,
@@ -404,6 +457,20 @@ final class KeyboardViewController: UIInputViewController {
         }
 
         refreshUI()
+
+        if state.status == .recording,
+           let requestID = state.requestID,
+           requestID == foregroundRecoveryRequestID {
+            foregroundRecoveryRequestID = nil
+        }
+
+        if state.status == .error,
+           !state.microphoneReady,
+           let requestID = state.requestID,
+           requestID == currentRequestID {
+            launchForegroundRecovery(requestID: requestID)
+            return
+        }
 
         if state.status == .completed,
            let requestID = state.requestID,
@@ -520,10 +587,15 @@ final class KeyboardViewController: UIInputViewController {
 
         switch latestState.status {
         case .idle:
-            statusLabel.text = localized(
-                "已待命 · 点击麦克风直接说",
-                "Ready · tap the microphone"
-            )
+            statusLabel.text = latestState.microphoneReady
+                ? localized(
+                    "已待命 · 点击麦克风直接说",
+                    "Ready · tap the microphone"
+                )
+                : localized(
+                    "服务在线 · 点击后先尝试恢复麦克风",
+                    "Service online · tap to recover the microphone"
+                )
             micButton.setTitle(
                 localized("🎙 开始语音", "🎙 Speak"),
                 for: .normal
@@ -592,24 +664,60 @@ final class KeyboardViewController: UIInputViewController {
         spaceButton.setTitle(localized("空格", "Space"), for: .normal)
     }
 
-    private func openContainingApp() {
+    private func launchForegroundRecovery(requestID: String) {
+        guard foregroundRecoveryRequestID != requestID else { return }
+        foregroundRecoveryRequestID = requestID
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            for _ in 0..<10 {
+                if let bundleID = self.hostBundleID
+                    ?? HostApplicationResolver.resolve(from: self) {
+                    self.hostBundleID = bundleID
+                    self.openContainingApp(requestID: requestID)
+                    return
+                }
+
+                do {
+                    try await Task.sleep(for: .milliseconds(120))
+                } catch {
+                    return
+                }
+            }
+
+            self.foregroundRecoveryRequestID = nil
+            self.statusLabel.text = self.localized(
+                "无法确认原输入应用，请再点一次麦克风",
+                "Could not identify the original app. Tap the microphone again."
+            )
+            self.resolveHostApplicationWithRetries()
+        }
+    }
+
+    private func openContainingApp(requestID: String) {
+        guard let hostBundleID, !hostBundleID.isEmpty else {
+            foregroundRecoveryRequestID = nil
+            statusLabel.text = localized(
+                "正在识别当前输入应用…",
+                "Identifying the current app…"
+            )
+            resolveHostApplicationWithRetries()
+            return
+        }
+
         var components = URLComponents()
         components.scheme = "typevoice"
         components.host = "prepare"
-        let requestID = coldStartRequestID ?? UUID().uuidString
-        coldStartRequestID = requestID
-
-        var items = [
+        components.queryItems = [
             URLQueryItem(name: "source", value: "keyboard"),
             URLQueryItem(name: "autostart", value: "1"),
-            URLQueryItem(name: "request", value: requestID)
+            URLQueryItem(name: "request", value: requestID),
+            URLQueryItem(name: "host", value: hostBundleID)
         ]
-        if let hostBundleID, !hostBundleID.isEmpty {
-            items.append(URLQueryItem(name: "host", value: hostBundleID))
-        }
-        components.queryItems = items
 
         guard let url = components.url else {
+            foregroundRecoveryRequestID = nil
             statusLabel.text = localized(
                 "无法打开 TypeVoice",
                 "Could not open TypeVoice"
@@ -618,15 +726,33 @@ final class KeyboardViewController: UIInputViewController {
         }
 
         statusLabel.text = localized(
-            "正在打开 TypeVoice 准备麦克风…",
-            "Opening TypeVoice to prepare the microphone…"
+            "后台恢复失败，正在打开 TypeVoice 激活麦克风…",
+            "Background recovery failed. Opening TypeVoice to activate the microphone…"
         )
 
-        extensionContext?.open(url) { [weak self] success in
-            DispatchQueue.main.async {
-                guard let self else { return }
+        // Prefer the same SwiftUI openURL handoff pattern already proven in
+        // VoiceKing. This is only a recovery fallback; the normal TypeVoice
+        // cold-start button remains the existing user-tapped SwiftUI Link.
+        recoveryURLLauncher.open(url)
 
-                if !success {
+        // Keep the old extensionContext path as a secondary fallback.
+        Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(600))
+            } catch {
+                return
+            }
+
+            guard let self,
+                  self.keyboardVisible,
+                  self.foregroundRecoveryRequestID == requestID else {
+                return
+            }
+
+            self.extensionContext?.open(url) { [weak self] success in
+                DispatchQueue.main.async {
+                    guard let self, !success else { return }
+                    self.foregroundRecoveryRequestID = nil
                     self.statusLabel.text = self.localized(
                         "请手动打开 TypeVoice 并开启快速语音",
                         "Open TypeVoice manually and enable Quick Dictation"
@@ -694,6 +820,7 @@ final class KeyboardViewController: UIInputViewController {
                     serverID: self.latestState.serverID,
                     revision: self.latestState.revision &+ 1,
                     serviceReady: self.latestState.serviceReady,
+                    microphoneReady: self.latestState.microphoneReady,
                     status: .idle,
                     requestID: nil,
                     transcribedText: nil,
