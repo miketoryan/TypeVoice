@@ -1,0 +1,18 @@
+# Xcode
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+*.xccheckout
+*.moved-aside
+*.xcscmblueprint
+
+# XcodeGen output can be regenerated from project.yml
+TypeVoice.xcodeproj/
+
+# macOS
+.DS_Store
+
+# Secrets
+.env
+Secrets.xcconfig

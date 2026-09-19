@@ -1,0 +1,51 @@
+name: TypeVoice
+options:
+  bundleIdPrefix: com.miketoryan
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    TARGETED_DEVICE_FAMILY: "1"
+targets:
+  TypeVoice:
+    type: application
+    platform: iOS
+    sources:
+      - path: TypeVoiceApp
+      - path: TypeVoiceShared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.miketoryan.TypeVoice
+        INFOPLIST_FILE: TypeVoiceApp/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Config/TypeVoice.entitlements
+        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "0.1.0"
+    dependencies:
+      - target: TypeVoiceKeyboard
+  TypeVoiceKeyboard:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: TypeVoiceKeyboard
+      - path: TypeVoiceShared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.miketoryan.TypeVoice.Keyboard
+        INFOPLIST_FILE: TypeVoiceKeyboard/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Config/TypeVoiceKeyboard.entitlements
+        APPLICATION_EXTENSION_API_ONLY: "YES"
+        SKIP_INSTALL: "YES"
+        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "0.1.0"
+schemes:
+  TypeVoice:
+    build:
+      targets:
+        TypeVoice: all
+        TypeVoiceKeyboard: all
+    run:
+      config: Debug
+    archive:
+      config: Release
