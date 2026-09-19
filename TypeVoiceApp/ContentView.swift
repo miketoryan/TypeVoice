@@ -1,25 +1,15 @@
 import SwiftUI
+import UIKit
 
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.openURL) private var openURL
 
     @AppStorage(SharedKeys.interfaceLanguage, store: SharedStore.defaults)
     private var languageRaw = TypeVoiceLanguage.chinese.rawValue
 
     @AppStorage(SharedKeys.quickMinutes, store: SharedStore.defaults)
     private var quickMinutes = 10
-
-    @AppStorage(SharedKeys.apiBaseURL, store: SharedStore.defaults)
-    private var apiBaseURL = "https://api.openai.com/v1"
-
-    @AppStorage(SharedKeys.transcriptionModel, store: SharedStore.defaults)
-    private var transcriptionModel = "gpt-transcribe"
-
-    @AppStorage(SharedKeys.cleanupModel, store: SharedStore.defaults)
-    private var cleanupModel = "gpt-5.6-luna"
-
-    @State private var apiKeyDraft = ""
-    @State private var showAdvanced = false
 
     private var isChinese: Bool {
         languageRaw != TypeVoiceLanguage.english.rawValue
@@ -28,6 +18,81 @@ struct ContentView: View {
     var body: some View {
         NavigationView {
             Form {
+                Section {
+                    if model.isChatGPTLoggedIn {
+                        HStack {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.green)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(text("已登录 ChatGPT", "Signed in to ChatGPT"))
+                                    .font(.headline)
+                                if let summary = model.chatGPTAccountSummary {
+                                    Text(summary)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                        }
+
+                        Button(role: .destructive) {
+                            model.logoutChatGPT()
+                        } label: {
+                            Text(text("退出 ChatGPT", "Sign out of ChatGPT"))
+                        }
+                    } else if model.isLoggingIn {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text(text("使用下面的验证码完成 ChatGPT 登录", "Use this code to finish ChatGPT sign-in"))
+                                .font(.subheadline)
+
+                            if let code = model.loginCode {
+                                Text(code)
+                                    .font(.system(.title2, design: .monospaced).weight(.bold))
+                                    .textSelection(.enabled)
+
+                                Button {
+                                    UIPasteboard.general.string = code
+                                } label: {
+                                    Label(text("复制验证码", "Copy code"), systemImage: "doc.on.doc")
+                                }
+                            }
+
+                            if let url = model.loginURL {
+                                Button {
+                                    openURL(url)
+                                } label: {
+                                    Label(text("打开 ChatGPT 登录页", "Open ChatGPT sign-in"), systemImage: "safari")
+                                }
+                            }
+
+                            HStack {
+                                ProgressView()
+                                Text(text("正在等待授权…", "Waiting for authorization…"))
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+
+                            Button(role: .cancel) {
+                                model.cancelChatGPTLogin()
+                            } label: {
+                                Text(text("取消登录", "Cancel sign-in"))
+                            }
+                        }
+                    } else {
+                        Button {
+                            model.startChatGPTLogin()
+                        } label: {
+                            Label(text("登录 ChatGPT", "Sign in with ChatGPT"), systemImage: "person.crop.circle.badge.checkmark")
+                        }
+                    }
+                } header: {
+                    Text(text("ChatGPT 账号", "ChatGPT account"))
+                } footer: {
+                    Text(text(
+                        "TypeVoice 不需要 OpenAI API Key。登录使用 Codex 的 ChatGPT 设备授权流程，登录凭据保存在本机 Keychain，并自动刷新。",
+                        "TypeVoice does not require an OpenAI API key. It uses Codex ChatGPT device authorization, stores credentials in the device Keychain, and refreshes them automatically."
+                    ))
+                }
+
                 Section {
                     HStack {
                         Circle()
@@ -49,9 +114,14 @@ struct ContentView: View {
                             Task { await model.arm() }
                         }
                     }
-                    .disabled(model.status == .recording || model.status == .transcribing || model.status == .polishing)
+                    .disabled(
+                        !model.isChatGPTLoggedIn
+                        || model.status == .recording
+                        || model.status == .transcribing
+                        || model.status == .polishing
+                    )
                 } header: {
-                    Text(text("状态", "Status"))
+                    Text(text("语音服务", "Voice service"))
                 } footer: {
                     Text(text(
                         "快速语音开启后，TypeVoice 会保持麦克风待命。后台服务就绪时，从键盘点击麦克风不会跳离当前 App。",
@@ -79,39 +149,6 @@ struct ContentView: View {
                     ))
                 }
 
-                Section {
-                    SecureField(text("OpenAI API Key", "OpenAI API Key"), text: $apiKeyDraft)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-
-                    Button(model.apiKeyConfigured ? text("更新 API Key", "Update API Key") : text("保存 API Key", "Save API Key")) {
-                        model.saveAPIKey(apiKeyDraft)
-                        apiKeyDraft = ""
-                    }
-                } header: {
-                    Text(text("AI 服务", "AI service"))
-                } footer: {
-                    Text(model.apiKeyConfigured
-                         ? text("API Key 已保存在本机 Keychain。", "The API key is stored in the device Keychain.")
-                         : text("ChatGPT Plus 不包含 API 调用额度，需要单独的 OpenAI API Key。", "ChatGPT Plus does not include API usage; an OpenAI API key is required."))
-                }
-
-                Section {
-                    DisclosureGroup(text("高级设置", "Advanced"), isExpanded: $showAdvanced) {
-                        TextField("API Base URL", text: $apiBaseURL)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-
-                        TextField(text("转录模型", "Transcription model"), text: $transcriptionModel)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-
-                        TextField(text("整理模型", "Cleanup model"), text: $cleanupModel)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                    }
-                }
-
                 if let transcript = model.lastTranscript, !transcript.isEmpty {
                     Section(text("最近一次结果", "Latest result")) {
                         Text(transcript)
@@ -131,8 +168,8 @@ struct ContentView: View {
                         Text(text("键盘使用方式", "Keyboard flow"))
                             .font(.headline)
                         Text(text(
-                            "1. 在系统设置中添加 TypeVoice 键盘并开启“允许完全访问”。\n2. 在这里开启快速语音。\n3. 回到任意输入框，切换到 TypeVoice。\n4. 点击麦克风开始，再点一次结束。\n5. 识别和整理完成后文字自动插入当前光标。",
-                            "1. Add the TypeVoice keyboard in iOS Settings and enable Full Access.\n2. Enable Quick Dictation here.\n3. Return to any text field and switch to TypeVoice.\n4. Tap the microphone to start and tap again to stop.\n5. The cleaned transcript is inserted automatically at the cursor."
+                            "1. 登录 ChatGPT。\n2. 在系统设置中添加 TypeVoice 键盘并开启“允许完全访问”。\n3. 在这里开启快速语音。\n4. 回到任意输入框，切换到 TypeVoice。\n5. 点击麦克风开始，再点一次结束。\n6. ChatGPT 识别和整理完成后，文字自动插入当前光标。",
+                            "1. Sign in with ChatGPT.\n2. Add the TypeVoice keyboard in iOS Settings and enable Full Access.\n3. Enable Quick Dictation here.\n4. Return to any text field and switch to TypeVoice.\n5. Tap the microphone to start and tap again to stop.\n6. After ChatGPT transcribes and cleans the speech, the text is inserted automatically at the cursor."
                         ))
                         .font(.subheadline)
                         .foregroundColor(.secondary)
@@ -167,6 +204,10 @@ struct ContentView: View {
     }
 
     private var statusSubtitle: String {
+        if !model.isChatGPTLoggedIn {
+            return text("先登录 ChatGPT。", "Sign in with ChatGPT first.")
+        }
+
         switch model.status {
         case .recording:
             return text("如果这是冷启动，请滑回刚才的 App 继续说话。", "If this was a cold start, swipe back to the previous app and keep speaking.")
@@ -175,7 +216,7 @@ struct ContentView: View {
         case .ready:
             return text("从键盘启动时无需跳转 TypeVoice。", "Keyboard dictation can start without switching apps.")
         default:
-            return text("先配置 API Key 并开启快速语音。", "Configure the API key and enable Quick Dictation.")
+            return text("开启快速语音后即可使用。", "Enable Quick Dictation to begin.")
         }
     }
 
