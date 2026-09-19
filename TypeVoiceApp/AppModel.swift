@@ -182,6 +182,12 @@ final class AppModel: ObservableObject {
         let requestedHostBundleID = components?.queryItems?
             .first(where: { $0.name == "host" })?
             .value
+        let requestedRecordingID = components?.queryItems?
+            .first(where: { $0.name == "request" })?
+            .value
+        let shouldAutoStart = components?.queryItems?
+            .first(where: { $0.name == "autostart" })?
+            .value == "1"
         let cameFromKeyboard = source == "keyboard"
 
         Task {
@@ -193,9 +199,21 @@ final class AppModel: ObservableObject {
                 return
             }
 
-            // Give AVAudioSession/AVAudioEngine a brief moment to settle before
-            // moving TypeVoice back to the background. The service continues
-            // running under the app's audio background mode.
+            if shouldAutoStart,
+               let requestedRecordingID,
+               !requestedRecordingID.isEmpty {
+                startRecordingFromKeyboard(requestID: requestedRecordingID)
+
+                guard bridgeStatus == .recording,
+                      activeRequestID == requestedRecordingID else {
+                    return
+                }
+            }
+
+            // Give the microphone graph a brief moment to settle before moving
+            // TypeVoice back to the background. In the auto-start path this
+            // means the user arrives back at the original text field with audio
+            // capture already active.
             try? await Task.sleep(for: .milliseconds(280))
 
             guard let requestedHostBundleID,
