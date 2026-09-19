@@ -24,6 +24,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.miketoryan.TypeVoice
         INFOPLIST_FILE: TypeVoiceApp/Info.plist
         CODE_SIGN_ENTITLEMENTS: Config/TypeVoice.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CURRENT_PROJECT_VERSION: "1"
         MARKETING_VERSION: "0.1.0"
     dependencies:
