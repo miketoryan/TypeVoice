@@ -10,6 +10,10 @@ enum HostApplicationResolver {
         KeyboardHost.resolve(from: controller)
     }
 
+    static var lastCaptured: String? {
+        KeyboardHost.lastCapturedHostBundleId
+    }
+
     static func invalidate() {
         KeyboardHost.invalidateCache()
     }
