@@ -172,10 +172,39 @@ final class AppModel: ObservableObject {
         guard url.scheme?.lowercased() == "typevoice" else { return }
         guard url.host?.lowercased() == "prepare" else { return }
 
+        let components = URLComponents(
+            url: url,
+            resolvingAgainstBaseURL: false
+        )
+        let source = components?.queryItems?
+            .first(where: { $0.name == "source" })?
+            .value
+        let requestedHostBundleID = components?.queryItems?
+            .first(where: { $0.name == "host" })?
+            .value
+        let cameFromKeyboard = source == "keyboard"
+
         Task {
             if !isServiceReady || !audioService.isRunning {
                 await arm()
             }
+
+            guard cameFromKeyboard, isServiceReady, audioService.isRunning else {
+                return
+            }
+
+            // Give AVAudioSession/AVAudioEngine a brief moment to settle before
+            // moving TypeVoice back to the background. The service continues
+            // running under the app's audio background mode.
+            try? await Task.sleep(for: .milliseconds(280))
+
+            guard let requestedHostBundleID,
+                  !requestedHostBundleID.isEmpty
+            else {
+                return
+            }
+
+            _ = PreviousAppReturner.open(bundleID: requestedHostBundleID)
         }
     }
 
