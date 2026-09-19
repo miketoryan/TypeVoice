@@ -142,6 +142,9 @@ final class AppModel: ObservableObject {
         status = SharedStore.status
         isServiceReady = SharedStore.isServiceReady() && audioService.isRunning
         lastError = SharedStore.lastError
+        if lastTranscript == nil {
+            lastTranscript = SharedStore.recoverableResultText
+        }
     }
 
     private func handleStartRequest() {
