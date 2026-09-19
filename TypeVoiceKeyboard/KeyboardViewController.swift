@@ -1,3 +1,4 @@
+import SwiftUI
 import UIKit
 
 final class KeyboardViewController: UIInputViewController {
@@ -7,6 +8,7 @@ final class KeyboardViewController: UIInputViewController {
     private let spaceButton = UIButton(type: .system)
     private let deleteButton = UIButton(type: .system)
     private let returnButton = UIButton(type: .system)
+    private var coldStartHost: UIHostingController<ColdStartMicLink>?
 
     private let bridge = LocalBridgeClient()
 
@@ -144,6 +146,27 @@ final class KeyboardViewController: UIInputViewController {
             utilityRow.heightAnchor.constraint(equalToConstant: 44),
             view.heightAnchor.constraint(greaterThanOrEqualToConstant: 160)
         ])
+
+        // Cold start is intentionally a real SwiftUI Link, not a programmatic
+        // extensionContext.open call. Dictus/Open Voice Typer use this pattern
+        // because a user-tapped Link can launch the containing app even when
+        // the keyboard's process cannot reliably do so from a button callback.
+        let coldHost = UIHostingController(
+            rootView: ColdStartMicLink(isEnglish: latestState.interfaceLanguage == "en")
+        )
+        coldHost.view.translatesAutoresizingMaskIntoConstraints = false
+        coldHost.view.backgroundColor = .clear
+        coldHost.view.isHidden = true
+        addChild(coldHost)
+        view.addSubview(coldHost.view)
+        NSLayoutConstraint.activate([
+            coldHost.view.leadingAnchor.constraint(equalTo: micButton.leadingAnchor),
+            coldHost.view.trailingAnchor.constraint(equalTo: micButton.trailingAnchor),
+            coldHost.view.topAnchor.constraint(equalTo: micButton.topAnchor),
+            coldHost.view.bottomAnchor.constraint(equalTo: micButton.bottomAnchor)
+        ])
+        coldHost.didMove(toParent: self)
+        coldStartHost = coldHost
     }
 
     private func configureUtilityButton(
@@ -322,6 +345,13 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func refreshUI() {
+        let shouldUseColdStartLink = hasFullAccess && !latestState.serviceReady
+        coldStartHost?.rootView = ColdStartMicLink(
+            isEnglish: latestState.interfaceLanguage == "en"
+        )
+        coldStartHost?.view.isHidden = !shouldUseColdStartLink
+        micButton.isUserInteractionEnabled = !shouldUseColdStartLink
+
         guard hasFullAccess else {
             statusLabel.text = localized(
                 "TypeVoice 需要“允许完全访问”",
@@ -353,8 +383,8 @@ final class KeyboardViewController: UIInputViewController {
 
         guard latestState.serviceReady else {
             statusLabel.text = latestState.lastError ?? localized(
-                "未待命：点击麦克风打开 TypeVoice",
-                "Not ready: tap the microphone to open TypeVoice"
+                "未待命 · 点击麦克风打开 TypeVoice",
+                "Not ready · tap the microphone to open TypeVoice"
             )
             micButton.setTitle(
                 localized("🎙 开始语音", "🎙 Speak"),
