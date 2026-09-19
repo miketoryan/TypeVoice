@@ -13,6 +13,7 @@ final class AppModel: ObservableObject {
     private let audioService = AudioStandbyService()
     private var observations: [DarwinObservation] = []
     private var expiryTimer: Timer?
+    private var commandPollTimer: Timer?
     private var processingTask: Task<Void, Never>?
 
     init() {
@@ -50,6 +51,7 @@ final class AppModel: ObservableObject {
 
     deinit {
         expiryTimer?.invalidate()
+        commandPollTimer?.invalidate()
         processingTask?.cancel()
     }
 
@@ -93,6 +95,7 @@ final class AppModel: ObservableObject {
             DarwinBus.post(.serviceChanged)
             DarwinBus.post(.statusChanged)
             installExpiryTimer()
+            installCommandPollTimer()
         } catch {
             fail(error.localizedDescription)
         }
@@ -103,11 +106,13 @@ final class AppModel: ObservableObject {
         processingTask = nil
         audioService.cancelRecording(keepWarm: false)
         SharedStore.status = .idle
-        SharedStore.clearStartRequest()
+        SharedStore.clearControlRequests()
         status = .idle
         isServiceReady = false
         expiryTimer?.invalidate()
         expiryTimer = nil
+        commandPollTimer?.invalidate()
+        commandPollTimer = nil
         DarwinBus.post(.serviceChanged)
         DarwinBus.post(.statusChanged)
     }
@@ -157,6 +162,7 @@ final class AppModel: ObservableObject {
     }
 
     private func stopRecording() {
+        SharedStore.clearStopRequest()
         guard audioService.isRecording else { return }
         guard let fileURL = audioService.finishRecording(keepWarm: true) else {
             fail("Recording file was not available.")
@@ -174,6 +180,7 @@ final class AppModel: ObservableObject {
     }
 
     private func cancelRecording() {
+        SharedStore.clearCancelRequest()
         audioService.cancelRecording(keepWarm: true)
         SharedStore.status = SharedStore.isServiceReady() ? .ready : .idle
         SharedStore.clearStartRequest()
@@ -235,6 +242,32 @@ final class AppModel: ObservableObject {
         status = .failed
         lastError = message
         DarwinBus.post(.statusChanged)
+    }
+
+    private func installCommandPollTimer() {
+        commandPollTimer?.invalidate()
+        commandPollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+
+                if SharedStore.pendingCancelRequestID != nil {
+                    self.cancelRecording()
+                    return
+                }
+
+                if SharedStore.pendingStopRequestID != nil {
+                    self.stopRecording()
+                    return
+                }
+
+                if SharedStore.pendingStartRequestID != nil,
+                   self.audioService.isRunning,
+                   SharedStore.isServiceReady(),
+                   !self.audioService.isRecording {
+                    self.handleStartRequest()
+                }
+            }
+        }
     }
 
     private func installExpiryTimer() {
