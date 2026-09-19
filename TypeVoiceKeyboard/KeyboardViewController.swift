@@ -154,7 +154,10 @@ final class KeyboardViewController: UIInputViewController {
         // because a user-tapped Link can launch the containing app even when
         // the keyboard's process cannot reliably do so from a button callback.
         let coldHost = UIHostingController(
-            rootView: ColdStartMicLink(\n                isEnglish: latestState.interfaceLanguage == "en",\n                hostBundleID: hostBundleID\n            )
+            rootView: ColdStartMicLink(
+                isEnglish: latestState.interfaceLanguage == "en",
+                hostBundleID: hostBundleID
+            )
         )
         coldHost.view.translatesAutoresizingMaskIntoConstraints = false
         coldHost.view.backgroundColor = .clear
