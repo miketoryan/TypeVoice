@@ -1,18 +1,19 @@
 import AVFoundation
 import Foundation
 
-final class AudioStandbyService {
+final class AudioStandbyService: @unchecked Sendable {
     private let engine = AVAudioEngine()
     private let lock = NSLock()
+
+    private var keepAlivePlayer: AVAudioPlayer?
     private var recordingFile: AVAudioFile?
     private var recordingURL: URL?
     private var tapInstalled = false
-    private var lastHeartbeat: TimeInterval = 0
-    private var expiryTimestamp: TimeInterval = 0
-    private var interruptionObserver: NSObjectProtocol?
+    private(set) var isArmed = false
 
-    var onExpired: (() -> Void)?
     var onInterrupted: (() -> Void)?
+
+    private var interruptionObserver: NSObjectProtocol?
 
     init() {
         interruptionObserver = NotificationCenter.default.addObserver(
@@ -25,6 +26,7 @@ final class AudioStandbyService {
                 let type = AVAudioSession.InterruptionType(rawValue: raw),
                 type == .began
             else { return }
+
             self?.onInterrupted?()
         }
     }
@@ -33,13 +35,20 @@ final class AudioStandbyService {
         if let interruptionObserver {
             NotificationCenter.default.removeObserver(interruptionObserver)
         }
-        if tapInstalled {
-            engine.inputNode.removeTap(onBus: 0)
-        }
+        stopCaptureEngine()
+        stopKeepAlive()
     }
 
     var isRunning: Bool {
-        engine.isRunning
+        isArmed && engine.isRunning
+    }
+
+    var isKeepingAlive: Bool {
+        keepAlivePlayer?.isPlaying == true
+    }
+
+    var isServiceAlive: Bool {
+        isRunning || isKeepingAlive
     }
 
     var isRecording: Bool {
@@ -56,53 +65,86 @@ final class AudioStandbyService {
         }
     }
 
-    func arm(until expiry: Date) throws {
-        expiryTimestamp = expiry.timeIntervalSince1970
-
-        if engine.isRunning {
-            SharedStore.touchServiceHeartbeat()
-            return
-        }
+    /// Background standby mode: keep the containing app alive without holding
+    /// the microphone open. This mirrors the proven VoiceKey strategy.
+    func enterStandby() throws {
+        stopCaptureEngine()
 
         let session = AVAudioSession.sharedInstance()
-        var options: AVAudioSession.CategoryOptions = [.mixWithOthers, .defaultToSpeaker]
-        options.insert(.allowBluetooth)
-        try session.setCategory(.playAndRecord, mode: .default, options: options)
+        try session.setCategory(
+            .playback,
+            mode: .default,
+            options: [.mixWithOthers]
+        )
+        try session.setActive(true)
+
+        if keepAlivePlayer == nil {
+            let player = try AVAudioPlayer(data: Self.silentWAVData)
+            player.numberOfLoops = -1
+            player.volume = 1
+            player.prepareToPlay()
+            keepAlivePlayer = player
+        }
+
+        guard keepAlivePlayer?.play() == true else {
+            throw AudioServiceError.keepAliveFailed
+        }
+    }
+
+    /// Activate the microphone when the TypeVoice keyboard is actually visible.
+    func armMicrophone() throws {
+        if isRunning { return }
+
+        stopKeepAlive()
+
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(
+            .playAndRecord,
+            mode: .measurement,
+            options: [.mixWithOthers, .allowBluetoothHFP]
+        )
         try? session.setAllowHapticsAndSystemSoundsDuringRecording(true)
         try session.setActive(true)
 
         let input = engine.inputNode
-        let format = input.outputFormat(forBus: 0)
+        let format = input.inputFormat(forBus: 0)
+
         guard format.sampleRate > 0, format.channelCount > 0 else {
             throw AudioServiceError.noInput
         }
 
         if !tapInstalled {
-            input.installTap(onBus: 0, bufferSize: 1_024, format: format) { [weak self] buffer, _ in
-                self?.handleAudio(buffer)
+            input.installTap(
+                onBus: 0,
+                bufferSize: 1_024,
+                format: format
+            ) { [weak self] buffer, _ in
+                self?.consume(buffer)
             }
             tapInstalled = true
         }
 
         engine.prepare()
         try engine.start()
-        SharedStore.touchServiceHeartbeat()
+        isArmed = true
     }
 
     func beginRecording() throws -> URL {
-        guard engine.isRunning else { throw AudioServiceError.notArmed }
-        guard !isRecording else { throw AudioServiceError.alreadyRecording }
+        guard isRunning else {
+            throw AudioServiceError.notArmed
+        }
+        guard !isRecording else {
+            throw AudioServiceError.alreadyRecording
+        }
 
-        let format = engine.inputNode.outputFormat(forBus: 0)
+        let format = engine.inputNode.inputFormat(forBus: 0)
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("typevoice-\(UUID().uuidString.lowercased())")
             .appendingPathExtension("wav")
 
         let file = try AVAudioFile(
             forWriting: url,
-            settings: format.settings,
-            commonFormat: format.commonFormat,
-            interleaved: format.isInterleaved
+            settings: format.settings
         )
 
         lock.lock()
@@ -113,20 +155,21 @@ final class AudioStandbyService {
         return url
     }
 
-    func finishRecording(keepWarm: Bool = true) -> URL? {
+    func finishRecording(keepMicrophoneActive: Bool = true) -> URL? {
         lock.lock()
         let url = recordingURL
         recordingFile = nil
         recordingURL = nil
         lock.unlock()
 
-        if !keepWarm {
-            disarm()
+        if !keepMicrophoneActive {
+            try? enterStandby()
         }
+
         return url
     }
 
-    func cancelRecording(keepWarm: Bool = true) {
+    func cancelRecording(keepMicrophoneActive: Bool = true) {
         lock.lock()
         let url = recordingURL
         recordingFile = nil
@@ -136,12 +179,23 @@ final class AudioStandbyService {
         if let url {
             try? FileManager.default.removeItem(at: url)
         }
-        if !keepWarm {
-            disarm()
+
+        if !keepMicrophoneActive {
+            try? enterStandby()
         }
     }
 
     func disarm() {
+        stopCaptureEngine()
+        stopKeepAlive()
+
+        try? AVAudioSession.sharedInstance().setActive(
+            false,
+            options: [.notifyOthersOnDeactivation]
+        )
+    }
+
+    private func stopCaptureEngine() {
         lock.lock()
         recordingFile = nil
         recordingURL = nil
@@ -150,53 +204,82 @@ final class AudioStandbyService {
         if engine.isRunning {
             engine.stop()
         }
-        try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
-        SharedStore.clearServiceReady()
+
+        if tapInstalled {
+            engine.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
+
+        isArmed = false
     }
 
-    private func handleAudio(_ buffer: AVAudioPCMBuffer) {
-        let now = Date().timeIntervalSince1970
+    private func stopKeepAlive() {
+        keepAlivePlayer?.stop()
+    }
 
-        if now - lastHeartbeat >= 1 {
-            lastHeartbeat = now
-            SharedStore.touchServiceHeartbeat(Date(timeIntervalSince1970: now))
-        }
-
+    private func consume(_ buffer: AVAudioPCMBuffer) {
         lock.lock()
         let file = recordingFile
-        let currentlyRecording = recordingFile != nil
-        lock.unlock()
-
         if let file {
-            do {
-                try file.write(from: buffer)
-            } catch {
-                // The coordinator will surface an error if the resulting file is unusable.
-            }
+            try? file.write(from: buffer)
         }
+        lock.unlock()
+    }
 
-        if !currentlyRecording, expiryTimestamp > 0, now >= expiryTimestamp {
-            expiryTimestamp = 0
-            DispatchQueue.main.async { [weak self] in
-                self?.onExpired?()
+    private static let silentWAVData: Data = {
+        let sampleRate: UInt32 = 8_000
+        let channels: UInt16 = 1
+        let bitsPerSample: UInt16 = 16
+        let seconds: UInt32 = 1
+        let bytesPerSample = UInt32(bitsPerSample / 8)
+        let dataSize = sampleRate * UInt32(channels) * bytesPerSample * seconds
+        let byteRate = sampleRate * UInt32(channels) * bytesPerSample
+        let blockAlign = channels * (bitsPerSample / 8)
+
+        var data = Data()
+        data.append(contentsOf: Array("RIFF".utf8))
+        data.appendLittleEndian(UInt32(36) + dataSize)
+        data.append(contentsOf: Array("WAVE".utf8))
+        data.append(contentsOf: Array("fmt ".utf8))
+        data.appendLittleEndian(UInt32(16))
+        data.appendLittleEndian(UInt16(1))
+        data.appendLittleEndian(channels)
+        data.appendLittleEndian(sampleRate)
+        data.appendLittleEndian(byteRate)
+        data.appendLittleEndian(blockAlign)
+        data.appendLittleEndian(bitsPerSample)
+        data.append(contentsOf: Array("data".utf8))
+        data.appendLittleEndian(dataSize)
+        data.append(Data(count: Int(dataSize)))
+        return data
+    }()
+
+    enum AudioServiceError: LocalizedError {
+        case noInput
+        case notArmed
+        case alreadyRecording
+        case keepAliveFailed
+
+        var errorDescription: String? {
+            switch self {
+            case .noInput:
+                return "No microphone input is available."
+            case .notArmed:
+                return "TypeVoice microphone service is not ready."
+            case .alreadyRecording:
+                return "A recording is already in progress."
+            case .keepAliveFailed:
+                return "TypeVoice could not keep its background service active."
             }
         }
     }
 }
 
-enum AudioServiceError: LocalizedError {
-    case noInput
-    case notArmed
-    case alreadyRecording
-
-    var errorDescription: String? {
-        switch self {
-        case .noInput:
-            return "No microphone input is available."
-        case .notArmed:
-            return "The background recording service is not ready."
-        case .alreadyRecording:
-            return "A recording is already in progress."
+private extension Data {
+    mutating func appendLittleEndian<T: FixedWidthInteger>(_ value: T) {
+        var littleEndian = value.littleEndian
+        Swift.withUnsafeBytes(of: &littleEndian) { bytes in
+            append(contentsOf: bytes)
         }
     }
 }
