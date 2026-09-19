@@ -17,6 +17,7 @@ final class KeyboardViewController: UIInputViewController {
     private var keyboardVisible = false
     private var mayAutoInsert = false
     private var insertionScheduledForRequestID: String?
+    private var hostBundleID: String?
 
     private var heartbeatTask: Task<Void, Never>?
     private var pollingTask: Task<Void, Never>?
@@ -31,6 +32,7 @@ final class KeyboardViewController: UIInputViewController {
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         keyboardVisible = true
+        hostBundleID = HostApplicationResolver.resolve(from: self)
         startBridgeTasks()
     }
 
@@ -152,7 +154,7 @@ final class KeyboardViewController: UIInputViewController {
         // because a user-tapped Link can launch the containing app even when
         // the keyboard's process cannot reliably do so from a button callback.
         let coldHost = UIHostingController(
-            rootView: ColdStartMicLink(isEnglish: latestState.interfaceLanguage == "en")
+            rootView: ColdStartMicLink(\n                isEnglish: latestState.interfaceLanguage == "en",\n                hostBundleID: hostBundleID\n            )
         )
         coldHost.view.translatesAutoresizingMaskIntoConstraints = false
         coldHost.view.backgroundColor = .clear
@@ -347,9 +349,11 @@ final class KeyboardViewController: UIInputViewController {
     private func refreshUI() {
         let shouldUseColdStartLink = hasFullAccess && !latestState.serviceReady
         coldStartHost?.rootView = ColdStartMicLink(
-            isEnglish: latestState.interfaceLanguage == "en"
+            isEnglish: latestState.interfaceLanguage == "en",
+            hostBundleID: hostBundleID
         )
         coldStartHost?.view.isHidden = !shouldUseColdStartLink
+        micButton.isHidden = shouldUseColdStartLink
         micButton.isUserInteractionEnabled = !shouldUseColdStartLink
 
         guard hasFullAccess else {
@@ -469,7 +473,16 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func openContainingApp() {
-        guard let url = URL(string: "typevoice://prepare?source=keyboard") else {
+        var components = URLComponents()
+        components.scheme = "typevoice"
+        components.host = "prepare"
+        var items = [URLQueryItem(name: "source", value: "keyboard")]
+        if let hostBundleID, !hostBundleID.isEmpty {
+            items.append(URLQueryItem(name: "host", value: hostBundleID))
+        }
+        components.queryItems = items
+
+        guard let url = components.url else {
             statusLabel.text = localized(
                 "无法打开 TypeVoice",
                 "Could not open TypeVoice"
