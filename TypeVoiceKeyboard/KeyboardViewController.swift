@@ -19,6 +19,7 @@ final class KeyboardViewController: UIInputViewController {
     private var mayAutoInsert = false
     private var insertionScheduledForRequestID: String?
     private var hostBundleID: String?
+    private var coldStartRequestID: String?
 
     private var heartbeatTask: Task<Void, Never>?
     private var pollingTask: Task<Void, Never>?
@@ -35,6 +36,7 @@ final class KeyboardViewController: UIInputViewController {
         super.viewWillAppear(animated)
         keyboardVisible = true
         hostBundleID = HostApplicationResolver.lastCaptured
+        coldStartRequestID = hostBundleID == nil ? nil : UUID().uuidString
         startBridgeTasks()
     }
 
@@ -52,6 +54,7 @@ final class KeyboardViewController: UIInputViewController {
         hostResolveTask = nil
         HostApplicationResolver.invalidate()
         hostBundleID = nil
+        coldStartRequestID = nil
         super.viewWillDisappear(animated)
     }
 
@@ -178,7 +181,8 @@ final class KeyboardViewController: UIInputViewController {
         let coldHost = UIHostingController(
             rootView: ColdStartMicLink(
                 isEnglish: latestState.interfaceLanguage == "en",
-                hostBundleID: hostBundleID
+                hostBundleID: hostBundleID,
+                requestID: coldStartRequestID ?? UUID().uuidString
             )
         )
         coldHost.view.translatesAutoresizingMaskIntoConstraints = false
@@ -206,6 +210,9 @@ final class KeyboardViewController: UIInputViewController {
             // viewDidAppear. Use it immediately, then confirm with fresh checks.
             if let cached = HostApplicationResolver.lastCaptured {
                 self.hostBundleID = cached
+                if self.coldStartRequestID == nil {
+                    self.coldStartRequestID = UUID().uuidString
+                }
                 self.refreshUI()
             }
 
@@ -220,6 +227,9 @@ final class KeyboardViewController: UIInputViewController {
 
                 if let bundleID = HostApplicationResolver.resolve(from: self) {
                     self.hostBundleID = bundleID
+                    if self.coldStartRequestID == nil {
+                        self.coldStartRequestID = UUID().uuidString
+                    }
                     self.refreshUI()
                     return
                 }
@@ -235,6 +245,7 @@ final class KeyboardViewController: UIInputViewController {
             // failure mode: TypeVoice starts successfully but has nowhere to
             // return. Leave the mic disabled and explain the state instead.
             self.hostBundleID = nil
+            self.coldStartRequestID = nil
             self.refreshUI()
         }
     }
@@ -379,6 +390,19 @@ final class KeyboardViewController: UIInputViewController {
         }
 
         latestState = state
+
+        if let requestID = state.requestID,
+           state.status == .starting
+            || state.status == .recording
+            || state.status == .transcribing
+            || state.status == .polishing
+            || state.status == .completed {
+            if currentRequestID == nil {
+                currentRequestID = requestID
+            }
+            mayAutoInsert = true
+        }
+
         refreshUI()
 
         if state.status == .completed,
@@ -423,9 +447,14 @@ final class KeyboardViewController: UIInputViewController {
         let hasReturnTarget = hostBundleID != nil
         let shouldUseColdStartLink = isColdState && hasReturnTarget
 
+        if hostBundleID != nil, coldStartRequestID == nil {
+            coldStartRequestID = UUID().uuidString
+        }
+
         coldStartHost?.rootView = ColdStartMicLink(
             isEnglish: latestState.interfaceLanguage == "en",
-            hostBundleID: hostBundleID
+            hostBundleID: hostBundleID,
+            requestID: coldStartRequestID ?? "pending"
         )
         coldStartHost?.view.isHidden = !shouldUseColdStartLink
         micButton.isHidden = shouldUseColdStartLink
@@ -567,7 +596,14 @@ final class KeyboardViewController: UIInputViewController {
         var components = URLComponents()
         components.scheme = "typevoice"
         components.host = "prepare"
-        var items = [URLQueryItem(name: "source", value: "keyboard")]
+        let requestID = coldStartRequestID ?? UUID().uuidString
+        coldStartRequestID = requestID
+
+        var items = [
+            URLQueryItem(name: "source", value: "keyboard"),
+            URLQueryItem(name: "autostart", value: "1"),
+            URLQueryItem(name: "request", value: requestID)
+        ]
         if let hostBundleID, !hostBundleID.isEmpty {
             items.append(URLQueryItem(name: "host", value: hostBundleID))
         }
