@@ -4,10 +4,10 @@ import SwiftUI
 
 @MainActor
 final class AppModel: ObservableObject {
-    @Published private(set) var status: TypeVoiceStatus = SharedStore.status
-    @Published private(set) var isServiceReady = SharedStore.isServiceReady()
+    @Published private(set) var status: TypeVoiceStatus = .idle
+    @Published private(set) var isServiceReady = false
     @Published private(set) var lastTranscript: String?
-    @Published private(set) var lastError: String? = SharedStore.lastError
+    @Published private(set) var lastError: String?
 
     @Published private(set) var isChatGPTLoggedIn = false
     @Published private(set) var isLoggingIn = false
@@ -15,52 +15,54 @@ final class AppModel: ObservableObject {
 
     private let audioService = AudioStandbyService()
     private let authManager = ChatGPTAuthManager()
-    private var observations: [DarwinObservation] = []
-    private var expiryTimer: Timer?
-    private var commandPollTimer: Timer?
+    private let localBridge = LocalBridgeServer()
+    private let serverID = UUID().uuidString
+
+    private var bridgeRevision: UInt64 = 0
+    private var bridgeStatus: BridgeStatus = .idle
+    private var activeRequestID: String?
+    private var responseText: String?
+    private var resultCreatedAt: Date?
+    private var bridgeError: String?
+
     private var processingTask: Task<Void, Never>?
     private var loginTask: Task<Void, Never>?
 
     init() {
         audioService.onExpired = { [weak self] in
-            Task { @MainActor in self?.disarm() }
+            Task { @MainActor in
+                self?.disarm()
+            }
         }
 
         audioService.onInterrupted = { [weak self] in
             Task { @MainActor in
-                self?.fail("Microphone session was interrupted.")
-                self?.audioService.disarm()
-                self?.refresh()
+                guard let self else { return }
+                self.publishBridgeError("Microphone session was interrupted.")
+                self.audioService.disarm()
+                self.isServiceReady = false
+                self.status = .failed
             }
         }
 
-        observations = [
-            DarwinBus.observe(.startRecording) { [weak self] in
-                DispatchQueue.main.async {
-                    self?.handleStartRequest()
+        do {
+            try localBridge.start { [weak self] request in
+                guard let self else {
+                    return BridgeState.unavailable("TypeVoice is not running.")
                 }
-            },
-            DarwinBus.observe(.stopRecording) { [weak self] in
-                DispatchQueue.main.async {
-                    self?.stopRecording()
-                }
-            },
-            DarwinBus.observe(.cancelRecording) { [weak self] in
-                DispatchQueue.main.async {
-                    self?.cancelRecording()
-                }
+                return await self.handleBridgeRequest(request)
             }
-        ]
+        } catch {
+            lastError = error.localizedDescription
+        }
 
         refreshAuthState()
-        refresh()
     }
 
     deinit {
-        expiryTimer?.invalidate()
-        commandPollTimer?.invalidate()
         processingTask?.cancel()
         loginTask?.cancel()
+        localBridge.stop()
     }
 
     func startChatGPTLogin() {
@@ -69,7 +71,6 @@ final class AppModel: ObservableObject {
         loginTask?.cancel()
         isLoggingIn = true
         lastError = nil
-        SharedStore.setError(nil)
 
         loginTask = Task { [weak self] in
             guard let self else { return }
@@ -82,12 +83,12 @@ final class AppModel: ObservableObject {
                 isChatGPTLoggedIn = true
                 chatGPTAccountSummary = Self.accountSummary(tokens)
                 lastError = nil
-                SharedStore.setError(nil)
             } catch is CancellationError {
                 isLoggingIn = false
             } catch {
                 isLoggingIn = false
-                fail(error.localizedDescription)
+                lastError = error.localizedDescription
+                status = .failed
             }
         }
     }
@@ -106,14 +107,13 @@ final class AppModel: ObservableObject {
         isChatGPTLoggedIn = false
         chatGPTAccountSummary = nil
         lastError = nil
-        SharedStore.setError(nil)
     }
 
     func arm() async {
         guard authManager.isLoggedIn else {
-            SharedStore.clearStartRequest()
             refreshAuthState()
-            fail("Sign in with ChatGPT first.")
+            lastError = "Sign in with ChatGPT first."
+            status = .failed
             return
         }
 
@@ -121,53 +121,51 @@ final class AppModel: ObservableObject {
             _ = try await authManager.validTokens()
             refreshAuthState()
         } catch {
-            SharedStore.clearStartRequest()
-            fail(error.localizedDescription)
+            lastError = error.localizedDescription
+            status = .failed
             return
         }
 
         let granted = await audioService.requestMicrophonePermission()
         guard granted else {
-            SharedStore.clearStartRequest()
-            fail("Microphone permission is required.")
+            lastError = "Microphone permission is required."
+            status = .failed
             return
         }
 
         do {
             let expiry = Date().addingTimeInterval(TimeInterval(SharedStore.quickMinutes * 60))
             try audioService.arm(until: expiry)
-            SharedStore.markServiceReady(expiresAt: expiry)
-            SharedStore.setError(nil)
-            status = .ready
-            lastError = nil
+
             isServiceReady = true
-            DarwinBus.post(.serviceChanged)
-            DarwinBus.post(.statusChanged)
-            installExpiryTimer()
-            installCommandPollTimer()
+            status = .ready
+            bridgeStatus = .idle
+            bridgeError = nil
+            activeRequestID = nil
+            responseText = nil
+            resultCreatedAt = nil
+            lastError = nil
+            markBridgeChanged()
         } catch {
-            SharedStore.clearStartRequest()
-            fail(error.localizedDescription)
+            publishBridgeError(error.localizedDescription)
+            status = .failed
         }
     }
 
     func disarm() {
         processingTask?.cancel()
         processingTask = nil
+
         audioService.cancelRecording(keepWarm: false)
-        SharedStore.status = .idle
-        SharedStore.clearControlRequests()
-        status = .idle
+
         isServiceReady = false
-
-        expiryTimer?.invalidate()
-        expiryTimer = nil
-
-        commandPollTimer?.invalidate()
-        commandPollTimer = nil
-
-        DarwinBus.post(.serviceChanged)
-        DarwinBus.post(.statusChanged)
+        status = .idle
+        bridgeStatus = .idle
+        activeRequestID = nil
+        responseText = nil
+        resultCreatedAt = nil
+        bridgeError = nil
+        markBridgeChanged()
     }
 
     func handleOpenURL(_ url: URL) {
@@ -175,28 +173,20 @@ final class AppModel: ObservableObject {
         guard url.host?.lowercased() == "prepare" else { return }
 
         Task {
-            if !SharedStore.isServiceReady() || !audioService.isRunning {
+            if !isServiceReady || !audioService.isRunning {
                 await arm()
-            }
-
-            if SharedStore.pendingStartRequestID != nil, audioService.isRunning {
-                handleStartRequest()
             }
         }
     }
 
     func appBecameActive() {
         refreshAuthState()
-        refresh()
-    }
 
-    func refresh() {
-        status = SharedStore.status
-        isServiceReady = SharedStore.isServiceReady() && audioService.isRunning
-        lastError = SharedStore.lastError
-
-        if lastTranscript == nil {
-            lastTranscript = SharedStore.recoverableResultText
+        if isServiceReady && !audioService.isRunning {
+            isServiceReady = false
+            status = .idle
+            bridgeStatus = .idle
+            markBridgeChanged()
         }
     }
 
@@ -213,53 +203,115 @@ final class AppModel: ObservableObject {
         return email
     }
 
-    private func handleStartRequest() {
-        guard SharedStore.pendingStartRequestID != nil else { return }
-        guard !audioService.isRecording else { return }
-        guard audioService.isRunning, SharedStore.isServiceReady() else { return }
+    private func handleBridgeRequest(_ request: BridgeRequest) async -> BridgeState {
+        switch request.action {
+        case .state:
+            break
 
-        do {
-            _ = try audioService.beginRecording()
-            SharedStore.status = .recording
-            SharedStore.setError(nil)
-            status = .recording
-            lastError = nil
-            SharedStore.clearStartRequest()
-            DarwinBus.post(.statusChanged)
-        } catch {
-            fail(error.localizedDescription)
+        case .heartbeat:
+            break
+
+        case .startRecording:
+            startRecordingFromKeyboard(requestID: request.requestID)
+
+        case .stopRecording:
+            stopRecordingFromKeyboard(expectedRequestID: request.requestID)
+
+        case .cancelRecording:
+            cancelRecordingFromKeyboard(expectedRequestID: request.requestID)
+
+        case .acknowledgeResult:
+            acknowledgeResult(requestID: request.requestID)
         }
+
+        return currentBridgeState()
     }
 
-    private func stopRecording() {
-        SharedStore.clearStopRequest()
-        guard audioService.isRecording else { return }
-
-        guard let fileURL = audioService.finishRecording(keepWarm: true) else {
-            fail("Recording file was not available.")
+    private func startRecordingFromKeyboard(requestID: String?) {
+        guard isServiceReady, audioService.isRunning else {
+            publishBridgeError(
+                "Open TypeVoice and enable Quick Dictation first.",
+                requestID: requestID
+            )
             return
         }
 
-        SharedStore.status = .transcribing
-        status = .transcribing
-        DarwinBus.post(.statusChanged)
+        guard let requestID, !requestID.isEmpty else {
+            publishBridgeError("TypeVoice received an invalid recording request.")
+            return
+        }
 
-        processingTask?.cancel()
-        processingTask = Task { [weak self] in
-            await self?.process(fileURL: fileURL)
+        guard bridgeStatus != .starting,
+              bridgeStatus != .recording,
+              bridgeStatus != .transcribing,
+              bridgeStatus != .polishing else {
+            return
+        }
+
+        bridgeStatus = .starting
+        status = .starting
+        activeRequestID = requestID
+        responseText = nil
+        resultCreatedAt = nil
+        bridgeError = nil
+        markBridgeChanged()
+
+        do {
+            _ = try audioService.beginRecording()
+            bridgeStatus = .recording
+            status = .recording
+            lastError = nil
+            markBridgeChanged()
+        } catch {
+            publishBridgeError(error.localizedDescription, requestID: requestID)
+            status = .failed
         }
     }
 
-    private func cancelRecording() {
-        SharedStore.clearCancelRequest()
-        audioService.cancelRecording(keepWarm: true)
-        SharedStore.status = SharedStore.isServiceReady() ? .ready : .idle
-        SharedStore.clearStartRequest()
-        refresh()
-        DarwinBus.post(.statusChanged)
+    private func stopRecordingFromKeyboard(expectedRequestID: String?) {
+        guard bridgeStatus == .recording else { return }
+
+        guard let requestID = activeRequestID,
+              expectedRequestID == nil || expectedRequestID == requestID else {
+            return
+        }
+
+        guard let fileURL = audioService.finishRecording(keepWarm: true) else {
+            publishBridgeError("Recording file was not available.", requestID: requestID)
+            status = .failed
+            return
+        }
+
+        bridgeStatus = .transcribing
+        status = .transcribing
+        bridgeError = nil
+        markBridgeChanged()
+
+        processingTask?.cancel()
+        processingTask = Task { [weak self] in
+            await self?.process(fileURL: fileURL, requestID: requestID)
+        }
     }
 
-    private func process(fileURL: URL) async {
+    private func cancelRecordingFromKeyboard(expectedRequestID: String?) {
+        guard expectedRequestID == nil || expectedRequestID == activeRequestID else {
+            return
+        }
+
+        processingTask?.cancel()
+        processingTask = nil
+        audioService.cancelRecording(keepWarm: true)
+
+        activeRequestID = nil
+        responseText = nil
+        resultCreatedAt = nil
+        bridgeError = nil
+        bridgeStatus = .idle
+        status = isServiceReady ? .ready : .idle
+        markBridgeChanged()
+    }
+
+    private func process(fileURL: URL, requestID: String) async {
         defer {
             try? FileManager.default.removeItem(at: fileURL)
         }
@@ -277,10 +329,12 @@ final class AppModel: ObservableObject {
                 raw = try await client.transcribe(fileURL: fileURL)
             }
 
+            guard !Task.isCancelled, activeRequestID == requestID else { return }
+
             lastTranscript = raw
-            SharedStore.status = .polishing
+            bridgeStatus = .polishing
             status = .polishing
-            DarwinBus.post(.statusChanged)
+            markBridgeChanged()
 
             let finalText: String
             do {
@@ -291,28 +345,27 @@ final class AppModel: ObservableObject {
                 finalText = try await client.cleanup(raw)
             } catch {
                 finalText = raw
-                SharedStore.setError(
-                    "Cleanup failed; inserted raw transcript. \(error.localizedDescription)"
-                )
+                lastError = "Cleanup failed; raw transcript will be inserted. \(error.localizedDescription)"
             }
 
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, activeRequestID == requestID else { return }
 
-            _ = SharedStore.publishResult(finalText)
+            responseText = finalText
+            resultCreatedAt = Date()
+            bridgeError = nil
+            bridgeStatus = .completed
+            status = isServiceReady ? .ready : .idle
             lastTranscript = finalText
-            SharedStore.status = SharedStore.isServiceReady() ? .ready : .idle
-            status = SharedStore.status
-            isServiceReady = SharedStore.isServiceReady()
             refreshAuthState()
-
-            DarwinBus.post(.resultReady)
-            DarwinBus.post(.statusChanged)
+            markBridgeChanged()
         } catch {
             if error is ChatGPTAuthError {
                 isChatGPTLoggedIn = false
                 chatGPTAccountSummary = nil
             }
-            fail(error.localizedDescription)
+
+            publishBridgeError(error.localizedDescription, requestID: requestID)
+            status = .failed
         }
     }
 
@@ -324,53 +377,50 @@ final class AppModel: ObservableObject {
         )
     }
 
-    private func fail(_ message: String) {
-        SharedStore.setError(message)
-        SharedStore.status = .failed
-        status = .failed
+    private func acknowledgeResult(requestID: String?) {
+        guard requestID == nil || requestID == activeRequestID else { return }
+
+        activeRequestID = nil
+        responseText = nil
+        resultCreatedAt = nil
+        bridgeError = nil
+
+        if bridgeStatus == .completed || bridgeStatus == .error {
+            bridgeStatus = .idle
+        }
+
+        status = isServiceReady ? .ready : .idle
+        markBridgeChanged()
+    }
+
+    private func publishBridgeError(_ message: String, requestID: String? = nil) {
+        if let requestID {
+            activeRequestID = requestID
+        }
+
+        responseText = nil
+        resultCreatedAt = Date()
+        bridgeError = message
+        bridgeStatus = .error
         lastError = message
-        DarwinBus.post(.statusChanged)
+        markBridgeChanged()
     }
 
-    private func installCommandPollTimer() {
-        commandPollTimer?.invalidate()
-        commandPollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-
-                if SharedStore.pendingCancelRequestID != nil {
-                    self.cancelRecording()
-                    return
-                }
-
-                if SharedStore.pendingStopRequestID != nil {
-                    self.stopRecording()
-                    return
-                }
-
-                if SharedStore.pendingStartRequestID != nil,
-                   self.audioService.isRunning,
-                   SharedStore.isServiceReady(),
-                   !self.audioService.isRecording {
-                    self.handleStartRequest()
-                }
-            }
-        }
+    private func currentBridgeState() -> BridgeState {
+        BridgeState(
+            serverID: serverID,
+            revision: bridgeRevision,
+            serviceReady: isServiceReady && audioService.isRunning,
+            status: bridgeStatus,
+            requestID: activeRequestID,
+            transcribedText: responseText,
+            resultCreatedAt: resultCreatedAt,
+            lastError: bridgeError,
+            interfaceLanguage: SharedStore.interfaceLanguage.rawValue
+        )
     }
 
-    private func installExpiryTimer() {
-        expiryTimer?.invalidate()
-        expiryTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-
-                let ready = SharedStore.isServiceReady()
-                self.isServiceReady = ready && self.audioService.isRunning
-
-                if !ready, !self.audioService.isRecording {
-                    self.disarm()
-                }
-            }
-        }
+    private func markBridgeChanged() {
+        bridgeRevision &+= 1
     }
 }
