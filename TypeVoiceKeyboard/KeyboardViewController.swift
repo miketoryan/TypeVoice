@@ -8,80 +8,86 @@ final class KeyboardViewController: UIInputViewController {
     private let deleteButton = UIButton(type: .system)
     private let returnButton = UIButton(type: .system)
 
-    private var observations: [DarwinObservation] = []
-    private var pollTimer: Timer?
-    private var launchFallback: DispatchWorkItem?
+    private let bridge = LocalBridgeClient()
+
+    private var latestState = BridgeState.unavailable()
+    private var currentRequestID: String?
+    private var keyboardVisible = false
+    private var mayAutoInsert = false
+    private var insertionScheduledForRequestID: String?
+
+    private var heartbeatTask: Task<Void, Never>?
+    private var pollingTask: Task<Void, Never>?
+    private var commandTask: Task<Void, Never>?
 
     override func viewDidLoad() {
         super.viewDidLoad()
         configureUI()
-        installObservers()
-        refresh()
+        refreshUI()
     }
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
-        refresh()
-        startPolling()
-        DispatchQueue.main.async { [weak self] in
-            self?.insertPendingResultIfNeeded()
-        }
+        keyboardVisible = true
+        startBridgeTasks()
     }
 
-    override func viewDidDisappear(_ animated: Bool) {
-        super.viewDidDisappear(animated)
-        stopPolling()
-        launchFallback?.cancel()
-        launchFallback = nil
+    override func viewWillDisappear(_ animated: Bool) {
+        keyboardVisible = false
+        mayAutoInsert = false
+        insertionScheduledForRequestID = nil
+        stopBridgeTasks()
+        super.viewWillDisappear(animated)
     }
 
     deinit {
-        stopPolling()
-        launchFallback?.cancel()
-    }
-
-    override func textDidChange(_ textInput: UITextInput?) {
-        super.textDidChange(textInput)
-        refresh()
+        heartbeatTask?.cancel()
+        pollingTask?.cancel()
+        commandTask?.cancel()
     }
 
     @objc private func microphoneTapped() {
         guard hasFullAccess else {
-            setStatus(localized("请开启“允许完全访问”", "Enable Full Access"))
+            statusLabel.text = localized(
+                "请在系统设置里开启“允许完全访问”",
+                "Enable Allow Full Access in Settings"
+            )
             return
         }
 
-        let status = SharedStore.status
-
-        if status == .recording {
-            launchFallback?.cancel()
-            launchFallback = nil
-            setStatus(localized("正在结束…", "Finishing…"))
-            _ = SharedStore.createStopRequest()
-            DarwinBus.post(.stopRecording)
+        if latestState.status == .completed,
+           let requestID = latestState.requestID,
+           latestState.isFreshResponse(for: requestID) {
+            insertLatestTranscription(automatically: false)
             return
         }
 
-        if status == .transcribing || status == .polishing || status == .starting {
-            setStatus(statusText(for: status))
+        guard latestState.serviceReady else {
+            openContainingApp()
             return
         }
 
-        let requestID = SharedStore.createStartRequest()
-        SharedStore.setError(nil)
+        switch latestState.status {
+        case .recording:
+            mayAutoInsert = true
+            sendCommand(
+                .stopRecording,
+                requestID: latestState.requestID ?? currentRequestID
+            )
 
-        if SharedStore.isServiceReady() {
-            SharedStore.status = .starting
-            setStatus(localized("正在启动…", "Starting…"))
-            DarwinBus.post(.startRecording)
-            DarwinBus.post(.statusChanged)
-            scheduleColdStartFallback(requestID: requestID)
-        } else {
-            openContainingApp(requestID: requestID)
+        case .starting, .transcribing, .polishing:
+            break
+
+        default:
+            startRecordingRequest()
         }
     }
 
     @objc private func globeTapped() {
+        keyboardVisible = false
+        mayAutoInsert = false
+        insertionScheduledForRequestID = nil
+        stopBridgeTasks()
         advanceToNextInputMode()
     }
 
@@ -98,11 +104,12 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func configureUI() {
-        view.backgroundColor = UIColor.secondarySystemBackground
+        view.backgroundColor = .secondarySystemBackground
 
         statusLabel.font = .systemFont(ofSize: 13, weight: .medium)
         statusLabel.textAlignment = .center
         statusLabel.numberOfLines = 2
+        statusLabel.textColor = .secondaryLabel
 
         micButton.titleLabel?.font = .systemFont(ofSize: 22, weight: .semibold)
         micButton.layer.cornerRadius = 24
@@ -113,7 +120,9 @@ final class KeyboardViewController: UIInputViewController {
         configureUtilityButton(returnButton, title: "↵", action: #selector(returnTapped))
         configureUtilityButton(spaceButton, title: localized("空格", "Space"), action: #selector(spaceTapped))
 
-        let utilityRow = UIStackView(arrangedSubviews: [globeButton, spaceButton, deleteButton, returnButton])
+        let utilityRow = UIStackView(
+            arrangedSubviews: [globeButton, spaceButton, deleteButton, returnButton]
+        )
         utilityRow.axis = .horizontal
         utilityRow.spacing = 8
         utilityRow.distribution = .fillProportionally
@@ -135,154 +144,357 @@ final class KeyboardViewController: UIInputViewController {
             utilityRow.heightAnchor.constraint(equalToConstant: 44),
             view.heightAnchor.constraint(greaterThanOrEqualToConstant: 160)
         ])
-
-        updateMicAppearance()
     }
 
-    private func configureUtilityButton(_ button: UIButton, title: String, action: Selector) {
+    private func configureUtilityButton(
+        _ button: UIButton,
+        title: String,
+        action: Selector
+    ) {
         button.setTitle(title, for: .normal)
         button.titleLabel?.font = .systemFont(ofSize: 16, weight: .medium)
-        button.backgroundColor = UIColor.tertiarySystemBackground
+        button.backgroundColor = .tertiarySystemBackground
         button.layer.cornerRadius = 8
-        button.contentEdgeInsets = UIEdgeInsets(top: 8, left: 14, bottom: 8, right: 14)
+        button.contentEdgeInsets = UIEdgeInsets(
+            top: 8,
+            left: 14,
+            bottom: 8,
+            right: 14
+        )
         button.addTarget(self, action: action, for: .touchUpInside)
     }
 
-    private func installObservers() {
-        observations = [
-            DarwinBus.observe(.statusChanged) { [weak self] in
-                DispatchQueue.main.async {
-                    self?.refresh()
+    private func startBridgeTasks() {
+        stopBridgeTasks()
+
+        heartbeatTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            await self.sendHeartbeat()
+
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: LocalBridge.keyboardHeartbeatInterval)
+                } catch {
+                    return
                 }
-            },
-            DarwinBus.observe(.serviceChanged) { [weak self] in
-                DispatchQueue.main.async {
-                    self?.refresh()
+                await self.sendHeartbeat()
+            }
+        }
+
+        pollingTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            await self.fetchState()
+
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .milliseconds(400))
+                } catch {
+                    return
                 }
-            },
-            DarwinBus.observe(.resultReady) { [weak self] in
-                DispatchQueue.main.async {
-                    self?.refresh()
-                    self?.insertPendingResultIfNeeded()
+                await self.fetchState()
+            }
+        }
+    }
+
+    private func stopBridgeTasks() {
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+
+        pollingTask?.cancel()
+        pollingTask = nil
+    }
+
+    private func sendHeartbeat() async {
+        guard keyboardVisible else { return }
+
+        do {
+            let state = try await bridge.send(.heartbeat)
+            apply(state)
+        } catch {
+            applyConnectionFailure()
+        }
+    }
+
+    private func fetchState() async {
+        guard keyboardVisible else { return }
+
+        do {
+            let state = try await bridge.fetchState()
+            apply(state)
+        } catch {
+            applyConnectionFailure()
+        }
+    }
+
+    private func sendCommand(_ action: BridgeAction, requestID: String?) {
+        commandTask?.cancel()
+
+        commandTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            do {
+                let state = try await self.bridge.send(
+                    action,
+                    requestID: requestID
+                )
+                self.apply(state)
+            } catch {
+                self.latestState = .unavailable(
+                    self.localized(
+                        "TypeVoice 后台服务没有响应。",
+                        "TypeVoice background service did not respond."
+                    ),
+                    interfaceLanguage: self.latestState.interfaceLanguage
+                )
+                self.refreshUI()
+
+                if action == .startRecording {
+                    self.openContainingApp()
                 }
             }
-        ]
-    }
-
-    private func startPolling() {
-        stopPolling()
-        let timer = Timer.scheduledTimer(withTimeInterval: 0.45, repeats: true) { [weak self] _ in
-            self?.refresh()
-            self?.insertPendingResultIfNeeded()
         }
-        RunLoop.main.add(timer, forMode: .common)
-        pollTimer = timer
     }
 
-    private func stopPolling() {
-        pollTimer?.invalidate()
-        pollTimer = nil
+    private func startRecordingRequest() {
+        let requestID = UUID().uuidString
+        currentRequestID = requestID
+        mayAutoInsert = true
+        insertionScheduledForRequestID = nil
+
+        latestState = BridgeState(
+            serverID: latestState.serverID,
+            revision: latestState.revision &+ 1,
+            serviceReady: true,
+            status: .starting,
+            requestID: requestID,
+            transcribedText: nil,
+            resultCreatedAt: nil,
+            lastError: nil,
+            interfaceLanguage: latestState.interfaceLanguage
+        )
+
+        refreshUI()
+        sendCommand(.startRecording, requestID: requestID)
     }
 
-    private func refresh() {
-        let status = SharedStore.status
-        setStatus(statusText(for: status))
-        updateMicAppearance()
+    private func apply(_ state: BridgeState) {
+        if state.serverID == latestState.serverID,
+           state.revision < latestState.revision {
+            return
+        }
 
-        if status == .recording {
-            launchFallback?.cancel()
-            launchFallback = nil
+        latestState = state
+        refreshUI()
+
+        if state.status == .completed,
+           let requestID = state.requestID,
+           insertionScheduledForRequestID != requestID {
+            insertionScheduledForRequestID = requestID
+
+            // Give the host text field one short turn to settle before the
+            // single physical insertText call. We do not auto-retry insertion.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+                guard let self else { return }
+                guard self.insertionScheduledForRequestID == requestID else { return }
+                self.insertionScheduledForRequestID = nil
+                self.insertLatestTranscription()
+            }
+        }
+    }
+
+    private func applyConnectionFailure() {
+        guard latestState.status != .recording,
+              latestState.status != .transcribing,
+              latestState.status != .polishing else {
+            return
+        }
+
+        latestState = .unavailable(
+            localized(
+                "未连接 TypeVoice：点击麦克风会打开主程序。",
+                "TypeVoice is not connected. Tap the microphone to open the app."
+            ),
+            interfaceLanguage: latestState.interfaceLanguage
+        )
+        refreshUI()
+    }
+
+    private func refreshUI() {
+        guard hasFullAccess else {
+            statusLabel.text = localized(
+                "TypeVoice 需要“允许完全访问”",
+                "TypeVoice needs Full Access"
+            )
+            micButton.setTitle(
+                localized("开启完全访问", "Enable Full Access"),
+                for: .normal
+            )
+            micButton.backgroundColor = .systemGray.withAlphaComponent(0.18)
+            return
+        }
+
+        if latestState.status == .completed,
+           let requestID = latestState.requestID,
+           latestState.isFreshResponse(for: requestID),
+           latestState.transcribedText != nil {
+            statusLabel.text = localized(
+                "识别完成，正在自动插入",
+                "Transcription ready · inserting"
+            )
+            micButton.setTitle(
+                localized("插入结果", "Insert Result"),
+                for: .normal
+            )
+            micButton.backgroundColor = .systemGreen.withAlphaComponent(0.18)
+            return
+        }
+
+        guard latestState.serviceReady else {
+            statusLabel.text = latestState.lastError ?? localized(
+                "未待命：点击麦克风打开 TypeVoice",
+                "Not ready: tap the microphone to open TypeVoice"
+            )
+            micButton.setTitle(
+                localized("🎙 开始语音", "🎙 Speak"),
+                for: .normal
+            )
+            micButton.backgroundColor = .systemBlue.withAlphaComponent(0.14)
+            return
+        }
+
+        switch latestState.status {
+        case .idle:
+            statusLabel.text = localized(
+                "已待命 · 点击麦克风直接说",
+                "Ready · tap the microphone"
+            )
+            micButton.setTitle(
+                localized("🎙 开始语音", "🎙 Speak"),
+                for: .normal
+            )
+            micButton.backgroundColor = .systemBlue.withAlphaComponent(0.14)
+
+        case .starting:
+            statusLabel.text = localized(
+                "正在连接录音服务…",
+                "Connecting to recorder…"
+            )
+            micButton.setTitle(
+                localized("正在启动…", "Starting…"),
+                for: .normal
+            )
+            micButton.backgroundColor = .systemGray.withAlphaComponent(0.18)
+
+        case .recording:
+            statusLabel.text = localized(
+                "正在录音 · 再点一次结束",
+                "Recording · tap again to stop"
+            )
+            micButton.setTitle(
+                localized("■ 结束语音", "■ Stop"),
+                for: .normal
+            )
+            micButton.backgroundColor = .systemRed.withAlphaComponent(0.18)
+
+        case .transcribing:
+            statusLabel.text = localized(
+                "正在识别…",
+                "Transcribing…"
+            )
+            micButton.setTitle(
+                localized("识别中…", "Transcribing…"),
+                for: .normal
+            )
+            micButton.backgroundColor = .systemGray.withAlphaComponent(0.18)
+
+        case .polishing:
+            statusLabel.text = localized(
+                "正在整理表达…",
+                "Cleaning up…"
+            )
+            micButton.setTitle(
+                localized("整理中…", "Cleaning…"),
+                for: .normal
+            )
+            micButton.backgroundColor = .systemGray.withAlphaComponent(0.18)
+
+        case .completed:
+            break
+
+        case .error:
+            statusLabel.text = latestState.lastError ?? localized(
+                "语音处理失败",
+                "Dictation failed"
+            )
+            micButton.setTitle(
+                localized("🎙 再试一次", "🎙 Try Again"),
+                for: .normal
+            )
+            micButton.backgroundColor = .systemOrange.withAlphaComponent(0.18)
         }
 
         spaceButton.setTitle(localized("空格", "Space"), for: .normal)
     }
 
-    private func updateMicAppearance() {
-        let recording = SharedStore.status == .recording
-        micButton.setTitle(
-            recording ? localized("■ 结束语音", "■ Stop") : localized("🎙 开始语音", "🎙 Speak"),
-            for: .normal
-        )
-        micButton.backgroundColor = recording
-            ? UIColor.systemRed.withAlphaComponent(0.16)
-            : UIColor.systemBlue.withAlphaComponent(0.14)
-        micButton.tintColor = recording ? .systemRed : .systemBlue
-    }
-
-    private func statusText(for status: TypeVoiceStatus) -> String {
-        if !hasFullAccess {
-            return localized("TypeVoice 需要“允许完全访问”", "TypeVoice needs Full Access")
-        }
-
-        switch status {
-        case .idle:
-            return SharedStore.isServiceReady()
-                ? localized("已待命", "Ready")
-                : localized("未待命：首次点击可能打开 TypeVoice", "Not ready: first tap may open TypeVoice")
-        case .ready:
-            return localized("已待命 · 点击麦克风直接说", "Ready · tap the microphone")
-        case .starting:
-            return localized("正在连接录音服务…", "Connecting to recorder…")
-        case .recording:
-            return localized("正在录音 · 再点一次结束", "Recording · tap again to stop")
-        case .transcribing:
-            return localized("正在识别…", "Transcribing…")
-        case .polishing:
-            return localized("正在整理表达…", "Cleaning up…")
-        case .failed:
-            return SharedStore.lastError ?? localized("出现问题，请打开 TypeVoice 查看", "Something went wrong. Open TypeVoice.")
-        }
-    }
-
-    private func scheduleColdStartFallback(requestID: UUID) {
-        launchFallback?.cancel()
-
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            guard SharedStore.pendingStartRequestID == requestID else { return }
-            guard SharedStore.status != .recording else { return }
-            self.openContainingApp(requestID: requestID)
-        }
-
-        launchFallback = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
-    }
-
-    private func openContainingApp(requestID: UUID) {
-        launchFallback?.cancel()
-        launchFallback = nil
-
-        guard let url = URL(string: "typevoice://prepare?source=keyboard&request=\(requestID.uuidString)") else {
-            setStatus(localized("无法打开 TypeVoice", "Could not open TypeVoice"))
+    private func openContainingApp() {
+        guard let url = URL(string: "typevoice://prepare?source=keyboard") else {
+            statusLabel.text = localized(
+                "无法打开 TypeVoice",
+                "Could not open TypeVoice"
+            )
             return
         }
 
-        setStatus(localized("正在准备麦克风…", "Preparing microphone…"))
+        statusLabel.text = localized(
+            "正在打开 TypeVoice 准备麦克风…",
+            "Opening TypeVoice to prepare the microphone…"
+        )
+
         extensionContext?.open(url) { [weak self] success in
             DispatchQueue.main.async {
+                guard let self else { return }
+
                 if !success {
-                    self?.setStatus(self?.localized(
-                        "请手动打开 TypeVoice 开启快速语音",
+                    self.statusLabel.text = self.localized(
+                        "请手动打开 TypeVoice 并开启快速语音",
                         "Open TypeVoice manually and enable Quick Dictation"
-                    ) ?? "Open TypeVoice")
+                    )
                 }
             }
         }
     }
 
-    private func insertPendingResultIfNeeded() {
+    private func insertLatestTranscription(automatically: Bool = true) {
         guard viewIfLoaded?.window != nil else { return }
-        guard let result = SharedStore.pendingResult() else { return }
-        guard !SharedStore.wasResultAttempted(result.id) else { return }
 
-        SharedStore.markResultAttempted(result.id)
+        guard let requestID = latestState.requestID,
+              latestState.isFreshResponse(for: requestID) else {
+            refreshUI()
+            return
+        }
+
+        if automatically {
+            guard keyboardVisible,
+                  mayAutoInsert,
+                  currentRequestID == requestID else {
+                refreshUI()
+                return
+            }
+        }
+
+        guard let text = latestState.transcribedText,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            refreshUI()
+            return
+        }
 
         let beforeContextCount = textDocumentProxy.documentContextBeforeInput?.utf16.count
         let beforeHasText = textDocumentProxy.hasText
 
-        // One physical insertion attempt only. Automatic retries can duplicate text
-        // when iOS reports a stale or truncated context window.
-        textDocumentProxy.insertText(result.text)
+        // Exactly one physical insertion call for this result.
+        textDocumentProxy.insertText(text)
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -304,23 +516,34 @@ final class KeyboardViewController: UIInputViewController {
                 || afterContextCount == nil
 
             if likelySucceeded {
-                SharedStore.markResultInserted(result.id)
-                self.setStatus(self.localized("已插入", "Inserted"))
+                self.currentRequestID = nil
+                self.mayAutoInsert = false
+                self.insertionScheduledForRequestID = nil
+
+                self.latestState = BridgeState(
+                    serverID: self.latestState.serverID,
+                    revision: self.latestState.revision &+ 1,
+                    serviceReady: self.latestState.serviceReady,
+                    status: .idle,
+                    requestID: nil,
+                    transcribedText: nil,
+                    resultCreatedAt: nil,
+                    lastError: nil,
+                    interfaceLanguage: self.latestState.interfaceLanguage
+                )
+
+                self.statusLabel.text = self.localized("已插入", "Inserted")
+                self.sendCommand(.acknowledgeResult, requestID: requestID)
             } else {
-                SharedStore.setError(self.localized(
-                    "识别完成，但当前输入框拒绝了自动插入。",
-                    "Transcription finished, but the current text field rejected insertion."
-                ))
-                self.setStatus(self.localized("自动插入失败", "Auto-insert failed"))
+                self.statusLabel.text = self.localized(
+                    "自动插入失败 · 点“插入结果”可再试",
+                    "Auto-insert failed · tap Insert Result to retry"
+                )
             }
         }
     }
 
-    private func setStatus(_ text: String) {
-        statusLabel.text = text
-    }
-
     private func localized(_ chinese: String, _ english: String) -> String {
-        SharedStore.interfaceLanguage == .english ? english : chinese
+        latestState.interfaceLanguage == "en" ? english : chinese
     }
 }
