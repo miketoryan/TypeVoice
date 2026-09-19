@@ -108,6 +108,7 @@ struct ContentView: View {
                     }
 
                     Picker(text("待命时长", "Ready window"), selection: $quickStandbySeconds) {
+                        Text(text("10 秒", "10 seconds")).tag(10)
                         Text(text("30 秒", "30 seconds")).tag(30)
                         Text(text("1 分钟", "1 minute")).tag(60)
                         Text(text("5 分钟", "5 minutes")).tag(300)
