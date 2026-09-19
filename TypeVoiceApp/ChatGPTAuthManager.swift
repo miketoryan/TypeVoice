@@ -1,26 +1,20 @@
+import AuthenticationServices
+import CryptoKit
 import Foundation
+import Security
+import UIKit
 
-struct ChatGPTTokens: Codable {
-    var accessToken: String
-    var refreshToken: String
-    var idToken: String?
-    var expiresAt: Date
-    var accountID: String?
-    var email: String?
-    var plan: String?
-}
+@MainActor
+final class ChatGPTAuthManager: NSObject, ASWebAuthenticationPresentationContextProviding {
+    private enum Config {
+        static let clientID = "app_EMoamEEZ73f0CkXaXp7hrann"
+        static let authorizeURL = "https://auth.openai.com/oauth/authorize"
+        static let tokenURL = "https://auth.openai.com/oauth/token"
+        static let redirectURI = "http://localhost:1455/auth/callback"
+        static let scopes = "openid profile email offline_access"
+    }
 
-struct ChatGPTDevicePrompt {
-    let deviceAuthID: String
-    let userCode: String
-    let verificationURL: URL
-    let interval: TimeInterval
-}
-
-final class ChatGPTAuthManager {
-    private let clientID = "app_EMoamEEZ73f0CkXaXp7hrann"
-    private let issuer = "https://auth.openai.com"
-    private let deviceRedirectURI = "https://auth.openai.com/deviceauth/callback"
+    private var authSession: ASWebAuthenticationSession?
 
     var storedTokens: ChatGPTTokens? {
         KeychainStore.loadChatGPTTokens()
@@ -31,302 +25,294 @@ final class ChatGPTAuthManager {
         return !tokens.accessToken.isEmpty && !tokens.refreshToken.isEmpty
     }
 
-    func beginDeviceLogin() async throws -> ChatGPTDevicePrompt {
-        guard let url = URL(string: issuer + "/api/accounts/deviceauth/usercode") else {
+    func signIn() async throws -> ChatGPTTokens {
+        let verifier = Self.randomURLSafeString(byteCount: 32)
+        let challenge = Self.base64URL(Data(SHA256.hash(data: Data(verifier.utf8))))
+        let state = Self.randomURLSafeString(byteCount: 24)
+
+        guard var components = URLComponents(string: Config.authorizeURL) else {
             throw ChatGPTAuthError.invalidURL
         }
 
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("TypeVoice/0.2", forHTTPHeaderField: "User-Agent")
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["client_id": clientID])
+        components.queryItems = [
+            URLQueryItem(name: "response_type", value: "code"),
+            URLQueryItem(name: "client_id", value: Config.clientID),
+            URLQueryItem(name: "redirect_uri", value: Config.redirectURI),
+            URLQueryItem(name: "scope", value: Config.scopes),
+            URLQueryItem(name: "state", value: state),
+            URLQueryItem(name: "code_challenge", value: challenge),
+            URLQueryItem(name: "code_challenge_method", value: "S256"),
+            URLQueryItem(name: "codex_cli_simplified_flow", value: "true"),
+            URLQueryItem(name: "id_token_add_organizations", value: "true")
+        ]
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw ChatGPTAuthError.invalidResponse
+        guard let authorizationURL = components.url else {
+            throw ChatGPTAuthError.invalidURL
         }
 
-        guard (200...299).contains(http.statusCode) else {
-            if http.statusCode == 404 {
-                throw ChatGPTAuthError.deviceCodeDisabled
-            }
-            throw ChatGPTAuthError.http(http.statusCode, responseMessage(data))
-        }
+        let callbackServer = OAuthCallbackServer()
+        let listener = try await callbackServer.start()
+        defer { listener.cancel() }
 
-        guard
-            let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let deviceAuthID = object["device_auth_id"] as? String,
-            let userCode = object["user_code"] as? String,
-            let verificationURL = URL(string: issuer + "/codex/device")
-        else {
-            throw ChatGPTAuthError.invalidResponse
-        }
+        let callbackURL = try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<URL, Error>) in
 
-        let interval: TimeInterval
-        if let number = object["interval"] as? NSNumber {
-            interval = max(1, number.doubleValue)
-        } else if let string = object["interval"] as? String, let value = Double(string) {
-            interval = max(1, value)
-        } else {
-            interval = 5
-        }
-
-        return ChatGPTDevicePrompt(
-            deviceAuthID: deviceAuthID,
-            userCode: userCode,
-            verificationURL: verificationURL,
-            interval: interval
-        )
-    }
-
-    func completeDeviceLogin(_ prompt: ChatGPTDevicePrompt) async throws -> ChatGPTTokens {
-        let deadline = Date().addingTimeInterval(15 * 60)
-
-        while Date() < deadline {
-            if Task.isCancelled { throw CancellationError() }
-
-            do {
-                if let code = try await pollDeviceAuthorization(prompt) {
-                    let tokens = try await exchangeAuthorizationCode(
-                        code.authorizationCode,
-                        codeVerifier: code.codeVerifier
-                    )
-                    try KeychainStore.saveChatGPTTokens(tokens)
-                    return tokens
+            let session = ASWebAuthenticationSession(
+                url: authorizationURL,
+                callbackURLScheme: "typevoice"
+            ) { url, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else if let url {
+                    continuation.resume(returning: url)
+                } else {
+                    continuation.resume(throwing: ChatGPTAuthError.missingCallback)
                 }
-            } catch ChatGPTAuthError.authorizationPending {
-                // Keep polling at the server-provided interval.
             }
 
-            try await Task.sleep(nanoseconds: UInt64(prompt.interval * 1_000_000_000))
+            session.presentationContextProvider = self
+            session.prefersEphemeralWebBrowserSession = false
+            self.authSession = session
+
+            guard session.start() else {
+                self.authSession = nil
+                continuation.resume(throwing: ChatGPTAuthError.unableToStartBrowser)
+                return
+            }
         }
 
-        throw ChatGPTAuthError.loginTimedOut
-    }
+        authSession = nil
 
-    func validTokens(forceRefresh: Bool = false) async throws -> ChatGPTTokens {
-        guard var tokens = storedTokens else {
-            throw ChatGPTAuthError.notLoggedIn
+        guard let callbackComponents = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false) else {
+            throw ChatGPTAuthError.invalidCallback
         }
 
-        if forceRefresh || tokens.expiresAt.timeIntervalSinceNow < 90 {
-            tokens = try await refresh(tokens)
-            try KeychainStore.saveChatGPTTokens(tokens)
+        let params = Dictionary(uniqueKeysWithValues: (callbackComponents.queryItems ?? []).compactMap { item in
+            item.value.map { (item.name, $0) }
+        })
+
+        guard params["state"] == state else {
+            throw ChatGPTAuthError.stateMismatch
         }
+
+        guard let code = params["code"] else {
+            throw ChatGPTAuthError.authorizationDenied(
+                params["error_description"] ?? params["error"] ?? "Unknown error"
+            )
+        }
+
+        let tokens = try await tokenRequest(
+            fields: [
+                "grant_type": "authorization_code",
+                "client_id": Config.clientID,
+                "redirect_uri": Config.redirectURI,
+                "code": code,
+                "code_verifier": verifier
+            ],
+            previous: nil
+        )
+
+        try KeychainStore.saveChatGPTTokens(tokens)
         return tokens
     }
 
+    func validTokens(forceRefresh: Bool = false) async throws -> ChatGPTTokens {
+        guard var current = storedTokens else {
+            throw ChatGPTAuthError.notLoggedIn
+        }
+
+        if forceRefresh || current.expiresAt.timeIntervalSinceNow < 300 {
+            guard !current.refreshToken.isEmpty else {
+                throw ChatGPTAuthError.refreshUnavailable
+            }
+
+            current = try await tokenRequest(
+                fields: [
+                    "grant_type": "refresh_token",
+                    "client_id": Config.clientID,
+                    "refresh_token": current.refreshToken
+                ],
+                previous: current
+            )
+
+            try KeychainStore.saveChatGPTTokens(current)
+        }
+
+        return current
+    }
+
     func logout() {
+        authSession?.cancel()
+        authSession = nil
         KeychainStore.deleteChatGPTTokens()
     }
 
-    private func pollDeviceAuthorization(
-        _ prompt: ChatGPTDevicePrompt
-    ) async throws -> (authorizationCode: String, codeVerifier: String)? {
-        guard let url = URL(string: issuer + "/api/accounts/deviceauth/token") else {
-            throw ChatGPTAuthError.invalidURL
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("TypeVoice/0.2", forHTTPHeaderField: "User-Agent")
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
-            "device_auth_id": prompt.deviceAuthID,
-            "user_code": prompt.userCode
-        ])
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw ChatGPTAuthError.invalidResponse
-        }
-
-        if http.statusCode == 403 || http.statusCode == 404 {
-            throw ChatGPTAuthError.authorizationPending
-        }
-        guard (200...299).contains(http.statusCode) else {
-            throw ChatGPTAuthError.http(http.statusCode, responseMessage(data))
-        }
-
-        guard
-            let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let authorizationCode = object["authorization_code"] as? String,
-            let codeVerifier = object["code_verifier"] as? String
-        else {
-            throw ChatGPTAuthError.invalidResponse
-        }
-
-        return (authorizationCode, codeVerifier)
+    func cancelLogin() {
+        authSession?.cancel()
+        authSession = nil
     }
 
-    private func exchangeAuthorizationCode(
-        _ code: String,
-        codeVerifier: String
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        if let window = scenes.flatMap({ $0.windows }).first(where: { $0.isKeyWindow }) {
+            return window
+        }
+        return ASPresentationAnchor()
+    }
+
+    private func tokenRequest(
+        fields: [String: String],
+        previous: ChatGPTTokens?
     ) async throws -> ChatGPTTokens {
-        let fields: [String: String] = [
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": deviceRedirectURI,
-            "client_id": clientID,
-            "code_verifier": codeVerifier
-        ]
-        let response = try await tokenRequest(fields)
-        return try makeStoredTokens(response, previous: nil)
-    }
-
-    private func refresh(_ current: ChatGPTTokens) async throws -> ChatGPTTokens {
-        let fields: [String: String] = [
-            "grant_type": "refresh_token",
-            "refresh_token": current.refreshToken,
-            "client_id": clientID
-        ]
-        let response = try await tokenRequest(fields)
-        return try makeStoredTokens(response, previous: current)
-    }
-
-    private func tokenRequest(_ fields: [String: String]) async throws -> OAuthTokenResponse {
-        guard let url = URL(string: issuer + "/oauth/token") else {
+        guard let url = URL(string: Config.tokenURL) else {
             throw ChatGPTAuthError.invalidURL
         }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        request.setValue("TypeVoice/0.2", forHTTPHeaderField: "User-Agent")
-        request.httpBody = formEncoded(fields).data(using: .utf8)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.httpBody = Self.formEncode(fields).data(using: .utf8)
 
         let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw ChatGPTAuthError.invalidResponse
-        }
-        guard (200...299).contains(http.statusCode) else {
-            throw ChatGPTAuthError.http(http.statusCode, responseMessage(data))
-        }
-        return try JSONDecoder().decode(OAuthTokenResponse.self, from: data)
-    }
 
-    private func makeStoredTokens(
-        _ response: OAuthTokenResponse,
-        previous: ChatGPTTokens?
-    ) throws -> ChatGPTTokens {
-        let refreshToken = response.refreshToken ?? previous?.refreshToken
-        guard let refreshToken, !refreshToken.isEmpty else {
-            throw ChatGPTAuthError.missingRefreshToken
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let detail = String(data: data, encoding: .utf8) ?? "Unknown response"
+            throw ChatGPTAuthError.tokenExchangeFailed(detail)
         }
 
-        let idToken = response.idToken ?? previous?.idToken
-        let metadata = decodeMetadata(idToken ?? response.accessToken)
-        let expiresIn = response.expiresIn ?? 3600
+        guard
+            let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let accessToken = object["access_token"] as? String
+        else {
+            throw ChatGPTAuthError.invalidTokenResponse
+        }
+
+        let refreshToken =
+            (object["refresh_token"] as? String)
+            ?? previous?.refreshToken
+            ?? ""
+
+        let idToken =
+            (object["id_token"] as? String)
+            ?? previous?.idToken
+
+        let expiresIn: TimeInterval = {
+            if let value = object["expires_in"] as? TimeInterval { return value }
+            if let value = object["expires_in"] as? Int { return TimeInterval(value) }
+            return 3600
+        }()
+
+        let claims = Self.decodeJWTPayload(accessToken)
+        let authClaims = claims?["https://api.openai.com/auth"] as? [String: Any]
+        let profileClaims = claims?["https://api.openai.com/profile"] as? [String: Any]
+
+        let accountID =
+            (claims?["chatgpt_account_id"] as? String)
+            ?? (authClaims?["chatgpt_account_id"] as? String)
+            ?? previous?.accountID
+
+        let email =
+            (claims?["email"] as? String)
+            ?? (profileClaims?["email"] as? String)
+            ?? previous?.email
+
+        let plan =
+            (claims?["chatgpt_plan_type"] as? String)
+            ?? (authClaims?["chatgpt_plan_type"] as? String)
+            ?? previous?.plan
 
         return ChatGPTTokens(
-            accessToken: response.accessToken,
+            accessToken: accessToken,
             refreshToken: refreshToken,
             idToken: idToken,
-            expiresAt: Date().addingTimeInterval(TimeInterval(max(60, expiresIn - 60))),
-            accountID: metadata.accountID ?? previous?.accountID,
-            email: metadata.email ?? previous?.email,
-            plan: metadata.plan ?? previous?.plan
+            expiresAt: Date().addingTimeInterval(expiresIn),
+            accountID: accountID,
+            email: email,
+            plan: plan
         )
     }
 
-    private func decodeMetadata(_ jwt: String) -> (accountID: String?, email: String?, plan: String?) {
+    private static func decodeJWTPayload(_ jwt: String) -> [String: Any]? {
         let parts = jwt.split(separator: ".")
-        guard parts.count >= 2 else { return (nil, nil, nil) }
+        guard parts.count >= 2 else { return nil }
 
-        var payload = String(parts[1])
+        var base64 = String(parts[1])
             .replacingOccurrences(of: "-", with: "+")
             .replacingOccurrences(of: "_", with: "/")
-        while payload.count % 4 != 0 { payload += "=" }
+
+        base64 += String(repeating: "=", count: (4 - base64.count % 4) % 4)
 
         guard
-            let data = Data(base64Encoded: payload),
-            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let data = Data(base64Encoded: base64),
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
-            return (nil, nil, nil)
+            return nil
         }
 
-        let email = object["email"] as? String
-        let auth = object["https://api.openai.com/auth"] as? [String: Any]
-        let accountID =
-            (auth?["chatgpt_account_id"] as? String)
-            ?? (object["chatgpt_account_id"] as? String)
-        let plan =
-            (auth?["chatgpt_plan_type"] as? String)
-            ?? (object["chatgpt_plan_type"] as? String)
-
-        return (accountID, email, plan)
+        return json
     }
 
-    private func formEncoded(_ fields: [String: String]) -> String {
-        fields
-            .sorted { $0.key < $1.key }
-            .map { key, value in
-                "\(percentEncode(key))=\(percentEncode(value))"
-            }
-            .joined(separator: "&")
+    private static func randomURLSafeString(byteCount: Int) -> String {
+        var bytes = [UInt8](repeating: 0, count: byteCount)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return base64URL(Data(bytes))
     }
 
-    private func percentEncode(_ value: String) -> String {
+    private static func base64URL(_ data: Data) -> String {
+        data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    private static func formEncode(_ values: [String: String]) -> String {
         var allowed = CharacterSet.alphanumerics
         allowed.insert(charactersIn: "-._~")
-        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
-    }
 
-    private func responseMessage(_ data: Data) -> String {
-        if
-            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let error = object["error"] as? [String: Any],
-            let message = error["message"] as? String
-        {
-            return message
+        return values.map { key, value in
+            let encodedKey = key.addingPercentEncoding(withAllowedCharacters: allowed) ?? key
+            let encodedValue = value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+            return "\(encodedKey)=\(encodedValue)"
         }
-        return String(data: data, encoding: .utf8) ?? "Unknown error"
-    }
-}
-
-private struct OAuthTokenResponse: Decodable {
-    let accessToken: String
-    let refreshToken: String?
-    let idToken: String?
-    let expiresIn: Int?
-
-    enum CodingKeys: String, CodingKey {
-        case accessToken = "access_token"
-        case refreshToken = "refresh_token"
-        case idToken = "id_token"
-        case expiresIn = "expires_in"
+        .joined(separator: "&")
     }
 }
 
 enum ChatGPTAuthError: LocalizedError {
     case invalidURL
-    case invalidResponse
+    case missingCallback
+    case invalidCallback
+    case stateMismatch
+    case authorizationDenied(String)
+    case tokenExchangeFailed(String)
+    case invalidTokenResponse
     case notLoggedIn
-    case deviceCodeDisabled
-    case authorizationPending
-    case loginTimedOut
-    case missingRefreshToken
-    case http(Int, String)
+    case refreshUnavailable
+    case unableToStartBrowser
 
     var errorDescription: String? {
         switch self {
         case .invalidURL:
-            return "Invalid ChatGPT authentication URL."
-        case .invalidResponse:
-            return "ChatGPT returned an invalid authentication response."
+            return "Invalid OAuth URL."
+        case .missingCallback:
+            return "No OAuth callback was received."
+        case .invalidCallback:
+            return "The OAuth callback was invalid."
+        case .stateMismatch:
+            return "OAuth state validation failed."
+        case .authorizationDenied(let message):
+            return "Sign in failed: \(message)"
+        case .tokenExchangeFailed(let message):
+            return "Token exchange failed: \(message)"
+        case .invalidTokenResponse:
+            return "OpenAI returned an invalid token response."
         case .notLoggedIn:
-            return "Please sign in with ChatGPT first."
-        case .deviceCodeDisabled:
-            return "Device-code login is disabled for this ChatGPT account. Enable device-code authorization in ChatGPT Security settings, then try again."
-        case .authorizationPending:
-            return "Waiting for ChatGPT authorization."
-        case .loginTimedOut:
-            return "ChatGPT login timed out. Start the login again."
-        case .missingRefreshToken:
-            return "ChatGPT login did not return a refresh token."
-        case .http(let status, let message):
-            return "ChatGPT login failed (HTTP \(status)): \(message)"
+            return "Sign in with ChatGPT first."
+        case .refreshUnavailable:
+            return "The ChatGPT session cannot be refreshed. Sign in again."
+        case .unableToStartBrowser:
+            return "Could not open the ChatGPT sign-in page."
         }
     }
 }
