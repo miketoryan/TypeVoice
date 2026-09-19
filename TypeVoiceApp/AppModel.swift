@@ -11,8 +11,6 @@ final class AppModel: ObservableObject {
 
     @Published private(set) var isChatGPTLoggedIn = false
     @Published private(set) var isLoggingIn = false
-    @Published private(set) var loginCode: String?
-    @Published private(set) var loginURL: URL?
     @Published private(set) var chatGPTAccountSummary: String?
 
     private let audioService = AudioStandbyService()
@@ -27,6 +25,7 @@ final class AppModel: ObservableObject {
         audioService.onExpired = { [weak self] in
             Task { @MainActor in self?.disarm() }
         }
+
         audioService.onInterrupted = { [weak self] in
             Task { @MainActor in
                 self?.fail("Microphone session was interrupted.")
@@ -65,51 +64,39 @@ final class AppModel: ObservableObject {
     }
 
     func startChatGPTLogin() {
+        guard !isLoggingIn else { return }
+
         loginTask?.cancel()
-        loginCode = nil
-        loginURL = nil
         isLoggingIn = true
         lastError = nil
         SharedStore.setError(nil)
 
         loginTask = Task { [weak self] in
             guard let self else { return }
+
             do {
-                let prompt = try await authManager.beginDeviceLogin()
-                guard !Task.isCancelled else { return }
-
-                loginCode = prompt.userCode
-                loginURL = prompt.verificationURL
-
-                let tokens = try await authManager.completeDeviceLogin(prompt)
+                let tokens = try await authManager.signIn()
                 guard !Task.isCancelled else { return }
 
                 isLoggingIn = false
-                loginCode = nil
-                loginURL = nil
                 isChatGPTLoggedIn = true
                 chatGPTAccountSummary = Self.accountSummary(tokens)
                 lastError = nil
                 SharedStore.setError(nil)
             } catch is CancellationError {
                 isLoggingIn = false
-                loginCode = nil
-                loginURL = nil
             } catch {
                 isLoggingIn = false
-                loginCode = nil
-                loginURL = nil
                 fail(error.localizedDescription)
             }
         }
     }
 
     func cancelChatGPTLogin() {
+        authManager.cancelLogin()
         loginTask?.cancel()
         loginTask = nil
         isLoggingIn = false
-        loginCode = nil
-        loginURL = nil
     }
 
     func logoutChatGPT() {
@@ -172,10 +159,13 @@ final class AppModel: ObservableObject {
         SharedStore.clearControlRequests()
         status = .idle
         isServiceReady = false
+
         expiryTimer?.invalidate()
         expiryTimer = nil
+
         commandPollTimer?.invalidate()
         commandPollTimer = nil
+
         DarwinBus.post(.serviceChanged)
         DarwinBus.post(.statusChanged)
     }
@@ -188,6 +178,7 @@ final class AppModel: ObservableObject {
             if !SharedStore.isServiceReady() || !audioService.isRunning {
                 await arm()
             }
+
             if SharedStore.pendingStartRequestID != nil, audioService.isRunning {
                 handleStartRequest()
             }
@@ -203,6 +194,7 @@ final class AppModel: ObservableObject {
         status = SharedStore.status
         isServiceReady = SharedStore.isServiceReady() && audioService.isRunning
         lastError = SharedStore.lastError
+
         if lastTranscript == nil {
             lastTranscript = SharedStore.recoverableResultText
         }
@@ -224,9 +216,7 @@ final class AppModel: ObservableObject {
     private func handleStartRequest() {
         guard SharedStore.pendingStartRequestID != nil else { return }
         guard !audioService.isRecording else { return }
-        guard audioService.isRunning, SharedStore.isServiceReady() else {
-            return
-        }
+        guard audioService.isRunning, SharedStore.isServiceReady() else { return }
 
         do {
             _ = try audioService.beginRecording()
@@ -244,6 +234,7 @@ final class AppModel: ObservableObject {
     private func stopRecording() {
         SharedStore.clearStopRequest()
         guard audioService.isRecording else { return }
+
         guard let fileURL = audioService.finishRecording(keepWarm: true) else {
             fail("Recording file was not available.")
             return
@@ -299,9 +290,10 @@ final class AppModel: ObservableObject {
                 client = makeClient(tokens)
                 finalText = try await client.cleanup(raw)
             } catch {
-                // Transcription remains usable if the experimental cleanup route changes.
                 finalText = raw
-                SharedStore.setError("Cleanup failed; inserted raw transcript. \(error.localizedDescription)")
+                SharedStore.setError(
+                    "Cleanup failed; inserted raw transcript. \(error.localizedDescription)"
+                )
             }
 
             guard !Task.isCancelled else { return }
@@ -312,16 +304,15 @@ final class AppModel: ObservableObject {
             status = SharedStore.status
             isServiceReady = SharedStore.isServiceReady()
             refreshAuthState()
+
             DarwinBus.post(.resultReady)
             DarwinBus.post(.statusChanged)
         } catch {
-            if let authError = error as? ChatGPTAuthError {
+            if error is ChatGPTAuthError {
                 isChatGPTLoggedIn = false
                 chatGPTAccountSummary = nil
-                fail(authError.localizedDescription)
-            } else {
-                fail(error.localizedDescription)
             }
+            fail(error.localizedDescription)
         }
     }
 
@@ -372,8 +363,10 @@ final class AppModel: ObservableObject {
         expiryTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
+
                 let ready = SharedStore.isServiceReady()
                 self.isServiceReady = ready && self.audioService.isRunning
+
                 if !ready, !self.audioService.isRecording {
                     self.disarm()
                 }
