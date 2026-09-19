@@ -8,13 +8,20 @@ final class AppModel: ObservableObject {
     @Published private(set) var isServiceReady = SharedStore.isServiceReady()
     @Published private(set) var lastTranscript: String?
     @Published private(set) var lastError: String? = SharedStore.lastError
-    @Published private(set) var apiKeyConfigured = !(KeychainStore.loadAPIKey() ?? "").isEmpty
+
+    @Published private(set) var isChatGPTLoggedIn = false
+    @Published private(set) var isLoggingIn = false
+    @Published private(set) var loginCode: String?
+    @Published private(set) var loginURL: URL?
+    @Published private(set) var chatGPTAccountSummary: String?
 
     private let audioService = AudioStandbyService()
+    private let authManager = ChatGPTAuthManager()
     private var observations: [DarwinObservation] = []
     private var expiryTimer: Timer?
     private var commandPollTimer: Timer?
     private var processingTask: Task<Void, Never>?
+    private var loginTask: Task<Void, Never>?
 
     init() {
         audioService.onExpired = { [weak self] in
@@ -46,6 +53,7 @@ final class AppModel: ObservableObject {
             }
         ]
 
+        refreshAuthState()
         refresh()
     }
 
@@ -53,29 +61,81 @@ final class AppModel: ObservableObject {
         expiryTimer?.invalidate()
         commandPollTimer?.invalidate()
         processingTask?.cancel()
+        loginTask?.cancel()
     }
 
-    func saveAPIKey(_ key: String) {
-        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            fail("API key cannot be empty.")
+    func startChatGPTLogin() {
+        loginTask?.cancel()
+        loginCode = nil
+        loginURL = nil
+        isLoggingIn = true
+        lastError = nil
+        SharedStore.setError(nil)
+
+        loginTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let prompt = try await authManager.beginDeviceLogin()
+                guard !Task.isCancelled else { return }
+
+                loginCode = prompt.userCode
+                loginURL = prompt.verificationURL
+
+                let tokens = try await authManager.completeDeviceLogin(prompt)
+                guard !Task.isCancelled else { return }
+
+                isLoggingIn = false
+                loginCode = nil
+                loginURL = nil
+                isChatGPTLoggedIn = true
+                chatGPTAccountSummary = Self.accountSummary(tokens)
+                lastError = nil
+                SharedStore.setError(nil)
+            } catch is CancellationError {
+                isLoggingIn = false
+                loginCode = nil
+                loginURL = nil
+            } catch {
+                isLoggingIn = false
+                loginCode = nil
+                loginURL = nil
+                fail(error.localizedDescription)
+            }
+        }
+    }
+
+    func cancelChatGPTLogin() {
+        loginTask?.cancel()
+        loginTask = nil
+        isLoggingIn = false
+        loginCode = nil
+        loginURL = nil
+    }
+
+    func logoutChatGPT() {
+        cancelChatGPTLogin()
+        disarm()
+        authManager.logout()
+        isChatGPTLoggedIn = false
+        chatGPTAccountSummary = nil
+        lastError = nil
+        SharedStore.setError(nil)
+    }
+
+    func arm() async {
+        guard authManager.isLoggedIn else {
+            SharedStore.clearStartRequest()
+            refreshAuthState()
+            fail("Sign in with ChatGPT first.")
             return
         }
 
         do {
-            try KeychainStore.saveAPIKey(trimmed)
-            apiKeyConfigured = true
-            lastError = nil
-            SharedStore.setError(nil)
+            _ = try await authManager.validTokens()
+            refreshAuthState()
         } catch {
-            fail(error.localizedDescription)
-        }
-    }
-
-    func arm() async {
-        guard apiKeyConfigured else {
             SharedStore.clearStartRequest()
-            fail("Add an OpenAI API key first.")
+            fail(error.localizedDescription)
             return
         }
 
@@ -135,6 +195,7 @@ final class AppModel: ObservableObject {
     }
 
     func appBecameActive() {
+        refreshAuthState()
         refresh()
     }
 
@@ -145,6 +206,19 @@ final class AppModel: ObservableObject {
         if lastTranscript == nil {
             lastTranscript = SharedStore.recoverableResultText
         }
+    }
+
+    private func refreshAuthState() {
+        isChatGPTLoggedIn = authManager.isLoggedIn
+        chatGPTAccountSummary = authManager.storedTokens.map(Self.accountSummary)
+    }
+
+    private static func accountSummary(_ tokens: ChatGPTTokens) -> String {
+        let email = tokens.email ?? "ChatGPT"
+        if let plan = tokens.plan, !plan.isEmpty {
+            return "\(email) · \(plan.capitalized)"
+        }
+        return email
     }
 
     private func handleStartRequest() {
@@ -199,22 +273,20 @@ final class AppModel: ObservableObject {
             try? FileManager.default.removeItem(at: fileURL)
         }
 
-        guard let apiKey = KeychainStore.loadAPIKey(), !apiKey.isEmpty else {
-            fail("OpenAI API key is missing.")
-            return
-        }
-
-        let client = OpenAIClient(
-            apiKey: apiKey,
-            baseURL: SharedStore.apiBaseURL,
-            transcriptionModel: SharedStore.transcriptionModel,
-            cleanupModel: SharedStore.cleanupModel
-        )
-
         do {
-            let raw = try await client.transcribe(fileURL: fileURL)
-            lastTranscript = raw
+            var tokens = try await authManager.validTokens()
+            var client = makeClient(tokens)
 
+            let raw: String
+            do {
+                raw = try await client.transcribe(fileURL: fileURL)
+            } catch let error as ChatGPTClientError where error.isUnauthorized {
+                tokens = try await authManager.validTokens(forceRefresh: true)
+                client = makeClient(tokens)
+                raw = try await client.transcribe(fileURL: fileURL)
+            }
+
+            lastTranscript = raw
             SharedStore.status = .polishing
             status = .polishing
             DarwinBus.post(.statusChanged)
@@ -222,8 +294,12 @@ final class AppModel: ObservableObject {
             let finalText: String
             do {
                 finalText = try await client.cleanup(raw)
+            } catch let error as ChatGPTClientError where error.isUnauthorized {
+                tokens = try await authManager.validTokens(forceRefresh: true)
+                client = makeClient(tokens)
+                finalText = try await client.cleanup(raw)
             } catch {
-                // Dictation should still be usable if cleanup fails.
+                // Transcription remains usable if the experimental cleanup route changes.
                 finalText = raw
                 SharedStore.setError("Cleanup failed; inserted raw transcript. \(error.localizedDescription)")
             }
@@ -235,11 +311,26 @@ final class AppModel: ObservableObject {
             SharedStore.status = SharedStore.isServiceReady() ? .ready : .idle
             status = SharedStore.status
             isServiceReady = SharedStore.isServiceReady()
+            refreshAuthState()
             DarwinBus.post(.resultReady)
             DarwinBus.post(.statusChanged)
         } catch {
-            fail(error.localizedDescription)
+            if let authError = error as? ChatGPTAuthError {
+                isChatGPTLoggedIn = false
+                chatGPTAccountSummary = nil
+                fail(authError.localizedDescription)
+            } else {
+                fail(error.localizedDescription)
+            }
         }
+    }
+
+    private func makeClient(_ tokens: ChatGPTTokens) -> ChatGPTClient {
+        ChatGPTClient(
+            accessToken: tokens.accessToken,
+            accountID: tokens.accountID,
+            cleanupModel: SharedStore.cleanupModel
+        )
     }
 
     private func fail(_ message: String) {
