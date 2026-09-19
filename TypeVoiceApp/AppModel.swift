@@ -134,7 +134,7 @@ final class AppModel: ObservableObject {
         }
 
         do {
-            let expiry = Date().addingTimeInterval(TimeInterval(SharedStore.quickMinutes * 60))
+            let expiry = Date().addingTimeInterval(TimeInterval(SharedStore.quickStandbySeconds))
             try audioService.arm(until: expiry)
 
             isServiceReady = true
