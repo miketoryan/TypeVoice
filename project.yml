@@ -3,6 +3,10 @@ options:
   bundleIdPrefix: com.miketoryan
   deploymentTarget:
     iOS: "16.0"
+packages:
+  KeyboardHostBundleID:
+    url: https://github.com/Muskupecli/KeyboardHostBundleID.git
+    branch: main
 settings:
   base:
     SWIFT_VERSION: "5.9"
@@ -39,6 +43,8 @@ targets:
         SKIP_INSTALL: "YES"
         CURRENT_PROJECT_VERSION: "1"
         MARKETING_VERSION: "0.1.0"
+    dependencies:
+      - package: KeyboardHostBundleID
 schemes:
   TypeVoice:
     build:
