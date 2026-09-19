@@ -57,6 +57,7 @@ final class KeyboardViewController: UIInputViewController {
             launchFallback?.cancel()
             launchFallback = nil
             setStatus(localized("正在结束…", "Finishing…"))
+            _ = SharedStore.createStopRequest()
             DarwinBus.post(.stopRecording)
             return
         }
