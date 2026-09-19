@@ -19,7 +19,7 @@ enum TypeVoiceLanguage: String, CaseIterable, Identifiable {
 
 enum SharedKeys {
     static let interfaceLanguage = "typevoice.interfaceLanguage"
-    static let quickMinutes = "typevoice.quickMinutes"
+    static let quickStandbySeconds = "typevoice.quickStandbySeconds"
     static let cleanupModel = "typevoice.cleanupModel"
 }
 
@@ -40,13 +40,13 @@ enum SharedStore {
         }
     }
 
-    static var quickMinutes: Int {
+    static var quickStandbySeconds: Int {
         get {
-            let value = defaults.integer(forKey: SharedKeys.quickMinutes)
-            return value == 0 ? 10 : value
+            let value = defaults.integer(forKey: SharedKeys.quickStandbySeconds)
+            return value == 0 ? 60 : value
         }
         set {
-            defaults.set(newValue, forKey: SharedKeys.quickMinutes)
+            defaults.set(newValue, forKey: SharedKeys.quickStandbySeconds)
         }
     }
 
