@@ -1,27 +1,24 @@
 import Foundation
 
-struct OpenAIClient {
-    let apiKey: String
-    let baseURL: String
-    let transcriptionModel: String
+struct ChatGPTClient {
+    let accessToken: String
+    let accountID: String?
     let cleanupModel: String
 
     func transcribe(fileURL: URL) async throws -> String {
-        let endpoint = try makeEndpoint("audio/transcriptions")
-        let boundary = "TypeVoice-\(UUID().uuidString)"
+        guard let endpoint = URL(string: "https://chatgpt.com/backend-api/transcribe") else {
+            throw ChatGPTClientError.invalidURL
+        }
 
+        let boundary = "----typevoice-transcribe-\(UUID().uuidString.lowercased())"
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        applyChatGPTHeaders(to: &request)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
         let audio = try Data(contentsOf: fileURL)
         var body = Data()
-
-        body.appendUTF8("--\(boundary)\r\n")
-        body.appendUTF8("Content-Disposition: form-data; name=\"model\"\r\n\r\n")
-        body.appendUTF8("\(transcriptionModel)\r\n")
-
         body.appendUTF8("--\(boundary)\r\n")
         body.appendUTF8("Content-Disposition: form-data; name=\"file\"; filename=\"typevoice.wav\"\r\n")
         body.appendUTF8("Content-Type: audio/wav\r\n\r\n")
@@ -32,22 +29,28 @@ struct OpenAIClient {
         let (data, response) = try await URLSession.shared.data(for: request)
         try validate(response: response, data: data)
 
-        let decoded = try JSONDecoder().decode(TranscriptionResponse.self, from: data)
-        let text = decoded.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { throw OpenAIError.emptyTranscription }
+        guard
+            let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let rawText = object["text"] as? String
+        else {
+            throw ChatGPTClientError.invalidResponse
+        }
+
+        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else {
+            throw ChatGPTClientError.emptyTranscription
+        }
         return text
     }
 
     func cleanup(_ transcript: String) async throws -> String {
-        let endpoint = try makeEndpoint("responses")
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        guard let endpoint = URL(string: "https://chatgpt.com/backend-api/codex/responses") else {
+            throw ChatGPTClientError.invalidURL
+        }
 
         let instructions = """
         You are TypeVoice, a dictation cleanup engine.
-        Return only the cleaned text, with no explanation or labels.
+        Return only the cleaned text, with no explanation, labels, markdown, or quotation marks.
         Keep the speaker's original language or mixed-language style. Never translate.
         Remove verbal filler such as 嗯、呃、那个、然后呢、uh, um, er only when they are filler.
         Remove stutters, accidental repetitions, duplicated phrases, abandoned fragments, and obvious false starts.
@@ -58,51 +61,119 @@ struct OpenAIClient {
         If the input is already clean, return it nearly unchanged.
         """
 
-        let payload = CleanupRequest(
-            model: cleanupModel,
-            instructions: instructions,
-            input: transcript
-        )
-        request.httpBody = try JSONEncoder().encode(payload)
+        let payload: [String: Any] = [
+            "model": cleanupModel,
+            "instructions": instructions,
+            "input": [
+                [
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        [
+                            "type": "input_text",
+                            "text": transcript
+                        ]
+                    ]
+                ]
+            ],
+            "tools": [],
+            "tool_choice": "none",
+            "parallel_tool_calls": false,
+            "store": false,
+            "stream": true,
+            "include": []
+        ]
+
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        applyChatGPTHeaders(to: &request)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         try validate(response: response, data: data)
 
-        let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-        if let direct = object?["output_text"] as? String {
-            let cleaned = direct.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !cleaned.isEmpty { return cleaned }
+        guard let stream = String(data: data, encoding: .utf8) else {
+            throw ChatGPTClientError.invalidResponse
         }
 
-        if let output = object?["output"] as? [[String: Any]] {
-            for item in output {
-                guard let content = item["content"] as? [[String: Any]] else { continue }
-                for part in content {
-                    guard
-                        (part["type"] as? String) == "output_text",
-                        let text = part["text"] as? String
-                    else { continue }
-                    let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !cleaned.isEmpty { return cleaned }
+        var result = ""
+        for line in stream.components(separatedBy: .newlines) {
+            guard line.hasPrefix("data:") else { continue }
+            let jsonText = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            if jsonText == "[DONE]" { continue }
+            guard
+                let jsonData = jsonText.data(using: .utf8),
+                let object = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any]
+            else {
+                continue
+            }
+
+            if
+                (object["type"] as? String) == "response.output_text.delta",
+                let delta = object["delta"] as? String
+            {
+                result += delta
+            } else if result.isEmpty, let completed = extractOutputText(from: object) {
+                result = completed
+            }
+        }
+
+        let cleaned = result.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else {
+            throw ChatGPTClientError.missingOutputText
+        }
+        return cleaned
+    }
+
+    private func applyChatGPTHeaders(to request: inout URLRequest) {
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        if let accountID, !accountID.isEmpty {
+            request.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-ID")
+        }
+        request.setValue("codex_cli_rs", forHTTPHeaderField: "originator")
+        request.setValue("TypeVoice/0.2 codex_cli_rs/0.153.4", forHTTPHeaderField: "User-Agent")
+    }
+
+    private func extractOutputText(from object: [String: Any]) -> String? {
+        if let direct = object["output_text"] as? String, !direct.isEmpty {
+            return direct
+        }
+
+        if
+            let response = object["response"] as? [String: Any],
+            let text = extractOutputTextFromResponse(response)
+        {
+            return text
+        }
+
+        return extractOutputTextFromResponse(object)
+    }
+
+    private func extractOutputTextFromResponse(_ response: [String: Any]) -> String? {
+        guard let output = response["output"] as? [[String: Any]] else { return nil }
+        var parts: [String] = []
+
+        for item in output {
+            guard let content = item["content"] as? [[String: Any]] else { continue }
+            for part in content {
+                if
+                    (part["type"] as? String) == "output_text",
+                    let text = part["text"] as? String,
+                    !text.isEmpty
+                {
+                    parts.append(text)
                 }
             }
         }
 
-        throw OpenAIError.missingOutputText
-    }
-
-    private func makeEndpoint(_ path: String) throws -> URL {
-        let base = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard let url = URL(string: base + "/" + path) else {
-            throw OpenAIError.invalidBaseURL
-        }
-        return url
+        return parts.isEmpty ? nil : parts.joined()
     }
 
     private func validate(response: URLResponse, data: Data) throws {
         guard let http = response as? HTTPURLResponse else {
-            throw OpenAIError.invalidResponse
+            throw ChatGPTClientError.invalidResponse
         }
         guard (200...299).contains(http.statusCode) else {
             let message: String
@@ -112,43 +183,45 @@ struct OpenAIClient {
                 let serverMessage = error["message"] as? String
             {
                 message = serverMessage
+            } else if
+                let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let detail = object["detail"] as? String
+            {
+                message = detail
             } else {
                 message = String(data: data, encoding: .utf8) ?? "HTTP \(http.statusCode)"
             }
-            throw OpenAIError.server(status: http.statusCode, message: message)
+            throw ChatGPTClientError.server(status: http.statusCode, message: message)
         }
     }
 }
 
-private struct TranscriptionResponse: Decodable {
-    let text: String
-}
-
-private struct CleanupRequest: Encodable {
-    let model: String
-    let instructions: String
-    let input: String
-}
-
-enum OpenAIError: LocalizedError {
-    case invalidBaseURL
+enum ChatGPTClientError: LocalizedError {
+    case invalidURL
     case invalidResponse
     case emptyTranscription
     case missingOutputText
     case server(status: Int, message: String)
 
+    var isUnauthorized: Bool {
+        if case .server(let status, _) = self {
+            return status == 401
+        }
+        return false
+    }
+
     var errorDescription: String? {
         switch self {
-        case .invalidBaseURL:
-            return "Invalid API base URL."
+        case .invalidURL:
+            return "Invalid ChatGPT endpoint."
         case .invalidResponse:
-            return "Invalid response from transcription service."
+            return "Invalid response from ChatGPT."
         case .emptyTranscription:
             return "No speech was recognized."
         case .missingOutputText:
-            return "The cleanup model returned no text."
+            return "ChatGPT returned no cleaned text."
         case .server(let status, let message):
-            return "API \(status): \(message)"
+            return "ChatGPT HTTP \(status): \(message)"
         }
     }
 }
