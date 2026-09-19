@@ -257,9 +257,19 @@ enum SharedStore {
         defaults.synchronize()
     }
 
+    static var recoverableResultText: String? {
+        guard
+            let rawID = defaults.string(forKey: SharedKeys.resultID),
+            defaults.string(forKey: SharedKeys.resultInsertedID) != rawID
+        else { return nil }
+        return defaults.string(forKey: SharedKeys.resultText)
+    }
+
     static func markResultInserted(_ id: UUID) {
         defaults.set(id.uuidString, forKey: SharedKeys.resultAttemptedID)
         defaults.set(id.uuidString, forKey: SharedKeys.resultInsertedID)
+        defaults.removeObject(forKey: SharedKeys.resultText)
+        defaults.removeObject(forKey: SharedKeys.resultCreatedAt)
         defaults.synchronize()
     }
 }
