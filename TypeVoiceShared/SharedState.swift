@@ -25,6 +25,8 @@ enum SharedKeys {
 
     static let startRequestID = "typevoice.startRequestID"
     static let startRequestAt = "typevoice.startRequestAt"
+    static let stopRequestID = "typevoice.stopRequestID"
+    static let cancelRequestID = "typevoice.cancelRequestID"
 
     static let resultID = "typevoice.resultID"
     static let resultText = "typevoice.resultText"
@@ -157,6 +159,56 @@ enum SharedStore {
         defaults.removeObject(forKey: SharedKeys.startRequestID)
         defaults.removeObject(forKey: SharedKeys.startRequestAt)
         defaults.synchronize()
+    }
+
+    @discardableResult
+    static func createStopRequest() -> UUID {
+        let id = UUID()
+        defaults.set(id.uuidString, forKey: SharedKeys.stopRequestID)
+        defaults.synchronize()
+        return id
+    }
+
+    static var pendingStopRequestID: UUID? {
+        guard let raw = defaults.string(forKey: SharedKeys.stopRequestID) else { return nil }
+        return UUID(uuidString: raw)
+    }
+
+    static func clearStopRequest(_ id: UUID? = nil) {
+        if let id,
+           defaults.string(forKey: SharedKeys.stopRequestID) != id.uuidString {
+            return
+        }
+        defaults.removeObject(forKey: SharedKeys.stopRequestID)
+        defaults.synchronize()
+    }
+
+    @discardableResult
+    static func createCancelRequest() -> UUID {
+        let id = UUID()
+        defaults.set(id.uuidString, forKey: SharedKeys.cancelRequestID)
+        defaults.synchronize()
+        return id
+    }
+
+    static var pendingCancelRequestID: UUID? {
+        guard let raw = defaults.string(forKey: SharedKeys.cancelRequestID) else { return nil }
+        return UUID(uuidString: raw)
+    }
+
+    static func clearCancelRequest(_ id: UUID? = nil) {
+        if let id,
+           defaults.string(forKey: SharedKeys.cancelRequestID) != id.uuidString {
+            return
+        }
+        defaults.removeObject(forKey: SharedKeys.cancelRequestID)
+        defaults.synchronize()
+    }
+
+    static func clearControlRequests() {
+        clearStartRequest()
+        clearStopRequest()
+        clearCancelRequest()
     }
 
     static func setError(_ message: String?) {
