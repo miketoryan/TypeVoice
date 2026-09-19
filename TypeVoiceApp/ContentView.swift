@@ -6,8 +6,8 @@ struct ContentView: View {
     @AppStorage(SharedKeys.interfaceLanguage, store: SharedStore.defaults)
     private var languageRaw = TypeVoiceLanguage.chinese.rawValue
 
-    @AppStorage(SharedKeys.quickMinutes, store: SharedStore.defaults)
-    private var quickMinutes = 10
+    @AppStorage(SharedKeys.quickStandbySeconds, store: SharedStore.defaults)
+    private var quickStandbySeconds = 60
 
     private var isChinese: Bool {
         languageRaw != TypeVoiceLanguage.english.rawValue
@@ -107,12 +107,10 @@ struct ContentView: View {
                         Text("English").tag(TypeVoiceLanguage.english.rawValue)
                     }
 
-                    Picker(text("待命时长", "Ready window"), selection: $quickMinutes) {
-                        Text(text("1 分钟", "1 minute")).tag(1)
-                        Text(text("5 分钟", "5 minutes")).tag(5)
-                        Text(text("10 分钟", "10 minutes")).tag(10)
-                        Text(text("20 分钟", "20 minutes")).tag(20)
-                        Text(text("60 分钟", "60 minutes")).tag(60)
+                    Picker(text("待命时长", "Ready window"), selection: $quickStandbySeconds) {
+                        Text(text("30 秒", "30 seconds")).tag(30)
+                        Text(text("1 分钟", "1 minute")).tag(60)
+                        Text(text("5 分钟", "5 minutes")).tag(300)
                     }
                 } header: {
                     Text(text("使用设置", "Usage"))
