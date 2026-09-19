@@ -30,3 +30,34 @@ jobs:
             -destination 'generic/platform=iOS Simulator' \
             CODE_SIGNING_ALLOWED=NO \
             build
+
+      - name: Build unsigned device app
+        run: |
+          set -o pipefail
+          rm -rf build/DerivedData build/Payload build/TypeVoice-unsigned.ipa
+          xcodebuild \
+            -project TypeVoice.xcodeproj \
+            -scheme TypeVoice \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+          APP_PATH="$(find build/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -name 'TypeVoice.app' -print -quit)"
+          test -n "$APP_PATH"
+          mkdir -p build/Payload
+          cp -R "$APP_PATH" build/Payload/TypeVoice.app
+          (
+            cd build
+            /usr/bin/zip -qry TypeVoice-unsigned.ipa Payload
+          )
+
+      - name: Upload AltServer IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: TypeVoice-AltServer-IPA
+          path: build/TypeVoice-unsigned.ipa
+          if-no-files-found: error
