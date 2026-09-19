@@ -150,7 +150,7 @@ final class KeyboardViewController: UIInputViewController {
         configureUtilityButton(spaceButton, title: localized("空格", "Space"), action: #selector(spaceTapped))
 
         let utilityRow = UIStackView(
-            arrangedSubviews: [globeButton, spaceButton, deleteButton, returnButton]
+            arrangedSubviews: [globeButton, spaceButton, returnButton, deleteButton]
         )
         utilityRow.axis = .horizontal
         utilityRow.spacing = 8
