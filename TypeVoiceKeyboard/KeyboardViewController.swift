@@ -23,6 +23,7 @@ final class KeyboardViewController: UIInputViewController {
     private var heartbeatTask: Task<Void, Never>?
     private var pollingTask: Task<Void, Never>?
     private var commandTask: Task<Void, Never>?
+    private var hostResolveTask: Task<Void, Never>?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -33,7 +34,7 @@ final class KeyboardViewController: UIInputViewController {
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         keyboardVisible = true
-        hostBundleID = nil
+        hostBundleID = HostApplicationResolver.lastCaptured
         startBridgeTasks()
     }
 
@@ -47,6 +48,8 @@ final class KeyboardViewController: UIInputViewController {
         mayAutoInsert = false
         insertionScheduledForRequestID = nil
         stopBridgeTasks()
+        hostResolveTask?.cancel()
+        hostResolveTask = nil
         HostApplicationResolver.invalidate()
         hostBundleID = nil
         super.viewWillDisappear(animated)
@@ -56,6 +59,7 @@ final class KeyboardViewController: UIInputViewController {
         heartbeatTask?.cancel()
         pollingTask?.cancel()
         commandTask?.cancel()
+        hostResolveTask?.cancel()
     }
 
     @objc private func microphoneTapped() {
@@ -193,27 +197,45 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func resolveHostApplicationWithRetries() {
-        guard keyboardVisible, viewIfLoaded?.window != nil else { return }
+        hostResolveTask?.cancel()
 
-        if let bundleID = HostApplicationResolver.resolve(from: self) {
-            hostBundleID = bundleID
-            refreshUI()
-            return
-        }
+        hostResolveTask = Task { @MainActor [weak self] in
+            guard let self else { return }
 
-        for delay in [0.15, 0.45, 0.9] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard let self,
+            // The arbiter hook may already have observed the current host before
+            // viewDidAppear. Use it immediately, then confirm with fresh checks.
+            if let cached = HostApplicationResolver.lastCaptured {
+                self.hostBundleID = cached
+                self.refreshUI()
+            }
+
+            for _ in 0..<20 {
+                guard !Task.isCancelled,
                       self.keyboardVisible,
                       self.viewIfLoaded?.window != nil,
-                      self.hostBundleID == nil
-                else { return }
+                      !self.latestState.serviceReady
+                else {
+                    return
+                }
 
                 if let bundleID = HostApplicationResolver.resolve(from: self) {
                     self.hostBundleID = bundleID
                     self.refreshUI()
+                    return
+                }
+
+                do {
+                    try await Task.sleep(for: .milliseconds(180))
+                } catch {
+                    return
                 }
             }
+
+            // Do not send a host-less cold-start URL. That is exactly the v0.7
+            // failure mode: TypeVoice starts successfully but has nowhere to
+            // return. Leave the mic disabled and explain the state instead.
+            self.hostBundleID = nil
+            self.refreshUI()
         }
     }
 
@@ -384,23 +406,30 @@ final class KeyboardViewController: UIInputViewController {
 
         latestState = .unavailable(
             localized(
-                "未连接 TypeVoice：点击麦克风会打开主程序。",
-                "TypeVoice is not connected. Tap the microphone to open the app."
+                "未连接 TypeVoice：正在准备冷启动。",
+                "TypeVoice is not connected. Preparing cold launch."
             ),
             interfaceLanguage: latestState.interfaceLanguage
         )
+
+        if hostBundleID == nil {
+            resolveHostApplicationWithRetries()
+        }
         refreshUI()
     }
 
     private func refreshUI() {
-        let shouldUseColdStartLink = hasFullAccess && !latestState.serviceReady
+        let isColdState = hasFullAccess && !latestState.serviceReady
+        let hasReturnTarget = hostBundleID != nil
+        let shouldUseColdStartLink = isColdState && hasReturnTarget
+
         coldStartHost?.rootView = ColdStartMicLink(
             isEnglish: latestState.interfaceLanguage == "en",
             hostBundleID: hostBundleID
         )
         coldStartHost?.view.isHidden = !shouldUseColdStartLink
         micButton.isHidden = shouldUseColdStartLink
-        micButton.isUserInteractionEnabled = !shouldUseColdStartLink
+        micButton.isUserInteractionEnabled = !isColdState
 
         guard hasFullAccess else {
             statusLabel.text = localized(
@@ -432,15 +461,31 @@ final class KeyboardViewController: UIInputViewController {
         }
 
         guard latestState.serviceReady else {
-            statusLabel.text = latestState.lastError ?? localized(
-                "未待命 · 点击麦克风打开 TypeVoice",
-                "Not ready · tap the microphone to open TypeVoice"
-            )
-            micButton.setTitle(
-                localized("🎙 开始语音", "🎙 Speak"),
-                for: .normal
-            )
-            micButton.backgroundColor = .systemBlue.withAlphaComponent(0.14)
+            if hostBundleID == nil {
+                statusLabel.text = localized(
+                    "正在识别当前输入应用…",
+                    "Identifying the current app…"
+                )
+                micButton.setTitle(
+                    localized("正在准备…", "Preparing…"),
+                    for: .normal
+                )
+                micButton.backgroundColor = .systemGray.withAlphaComponent(0.18)
+
+                if hostResolveTask == nil || hostResolveTask?.isCancelled == true {
+                    resolveHostApplicationWithRetries()
+                }
+            } else {
+                statusLabel.text = latestState.lastError ?? localized(
+                    "未待命 · 点击麦克风短暂打开 TypeVoice",
+                    "Not ready · tap the microphone to briefly open TypeVoice"
+                )
+                micButton.setTitle(
+                    localized("🎙 开始语音", "🎙 Speak"),
+                    for: .normal
+                )
+                micButton.backgroundColor = .systemBlue.withAlphaComponent(0.14)
+            }
             return
         }
 
