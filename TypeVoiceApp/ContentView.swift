@@ -76,14 +76,22 @@ struct ContentView: View {
                     }
 
                     Button(
-                        model.isServiceReady
+                        model.isQuickDictationEnabled
                             ? text("关闭快速语音", "Disable Quick Dictation")
                             : text("开启快速语音", "Enable Quick Dictation")
                     ) {
-                        if model.isServiceReady {
+                        if model.isQuickDictationEnabled {
                             model.disarm()
                         } else {
                             Task { await model.arm() }
+                        }
+                    }
+
+                    if model.isQuickDictationEnabled && !model.isServiceReady {
+                        Button {
+                            Task { await model.arm() }
+                        } label: {
+                            Text(text("立即激活麦克风", "Activate Microphone Now"))
                         }
                     }
                     .disabled(
@@ -107,7 +115,7 @@ struct ContentView: View {
                         Text("English").tag(TypeVoiceLanguage.english.rawValue)
                     }
 
-                    Picker(text("后台待命时间", "Background ready window"), selection: $quickStandbySeconds) {
+                    Picker(text("退出键盘后的热待命时间", "Warm time after leaving keyboard"), selection: $quickStandbySeconds) {
                         Text(text("10 秒", "10 seconds")).tag(10)
                         Text(text("30 秒", "30 seconds")).tag(30)
                         Text(text("1 分钟", "1 minute")).tag(60)
@@ -162,9 +170,17 @@ struct ContentView: View {
     }
 
     private var statusTitle: String {
+        if !model.isQuickDictationEnabled {
+            return text("未开启", "Disabled")
+        }
+
+        if !model.isServiceReady, model.status == .idle {
+            return text("冷待命", "Cold standby")
+        }
+
         switch model.status {
         case .idle:
-            return text("未待命", "Not ready")
+            return text("冷待命", "Cold standby")
         case .ready:
             return text("已待命", "Ready")
         case .starting:
@@ -185,6 +201,13 @@ struct ContentView: View {
             return text("先登录 ChatGPT。", "Sign in with ChatGPT first.")
         }
 
+        if !model.isQuickDictationEnabled {
+            return text(
+                "开启后，键盘可使用热待命语音输入。",
+                "Enable Quick Dictation to use warm voice input from the keyboard."
+            )
+        }
+
         switch model.status {
         case .recording:
             return text("正在录音，再点一次麦克风结束。", "Recording; tap the microphone again to stop.")
@@ -192,11 +215,16 @@ struct ContentView: View {
             return text("完成后会自动插入当前输入框。", "The result will be inserted automatically.")
         case .ready:
             return text(
-                "麦克风已热启动；退出 TypeVoice 键盘后才开始计算后台待命时间。",
-                "Microphone warm standby is active; the ready-window countdown starts only after leaving the TypeVoice keyboard."
+                "麦克风已热启动；退出 TypeVoice 键盘后才开始计算热待命时间。",
+                "Microphone warm standby is active; the timer starts only after leaving the TypeVoice keyboard."
+            )
+        case .idle:
+            return text(
+                "快速语音仍然开启，但麦克风已释放；下次从键盘使用时会短暂打开 TypeVoice 重新激活。",
+                "Quick Dictation is still enabled, but the microphone is released. The next keyboard use may briefly open TypeVoice to reactivate it."
             )
         default:
-            return text("开启快速语音后即可使用。", "Enable Quick Dictation to begin.")
+            return text("快速语音已开启。", "Quick Dictation is enabled.")
         }
     }
 
