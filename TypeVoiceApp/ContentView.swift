@@ -96,8 +96,8 @@ struct ContentView: View {
                     Text(text("语音服务", "Voice service"))
                 } footer: {
                     Text(text(
-                        "快速语音采用后台麦克风热启动：待命期间麦克风输入会保持开启，录音时只切换保存状态，不重新启动音频硬件。达到你设置的待命时长后会自动关闭麦克风；之后从键盘再次使用时，允许短暂跳转 TypeVoice 激活后再返回输入框。",
-                        "Quick Dictation uses a warm background microphone. During the ready window, microphone input stays open and dictation only toggles whether buffers are saved; audio hardware is not restarted. When the selected ready window expires, the microphone turns off. The next keyboard use may briefly open TypeVoice to reactivate it and return."
+                        "快速语音采用后台麦克风热启动：只要 TypeVoice 键盘还显示在屏幕上，就不会开始后台待命倒计时。只有退出/收起 TypeVoice 键盘后，才从那一刻开始计算你设置的 10 秒、30 秒、1 分钟或 5 分钟；到期后自动关闭麦克风。之后再次从键盘使用时，允许短暂跳转 TypeVoice 激活后再返回输入框。",
+                        "Quick Dictation uses a warm background microphone. The standby countdown does not run while the TypeVoice keyboard is visible. It starts only when the TypeVoice keyboard is dismissed or exited, using the selected 10 seconds, 30 seconds, 1 minute, or 5 minutes. When that window expires, the microphone turns off. The next use may briefly open TypeVoice to reactivate it and return."
                     ))
                 }
 
@@ -192,8 +192,8 @@ struct ContentView: View {
             return text("完成后会自动插入当前输入框。", "The result will be inserted automatically.")
         case .ready:
             return text(
-                "麦克风已热启动，将按“后台待命时间”自动关闭。",
-                "Microphone warm standby is active and will close after the selected ready window."
+                "麦克风已热启动；退出 TypeVoice 键盘后才开始计算后台待命时间。",
+                "Microphone warm standby is active; the ready-window countdown starts only after leaving the TypeVoice keyboard."
             )
         default:
             return text("开启快速语音后即可使用。", "Enable Quick Dictation to begin.")
