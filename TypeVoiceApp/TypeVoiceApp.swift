@@ -13,8 +13,13 @@ struct TypeVoiceApp: App {
                     model.handleOpenURL(url)
                 }
                 .onChange(of: scenePhase) { newPhase in
-                    if newPhase == .active {
+                    switch newPhase {
+                    case .active:
                         model.appBecameActive()
+                    case .background:
+                        model.appEnteredBackground()
+                    default:
+                        break
                     }
                 }
         }
