@@ -696,9 +696,9 @@ final class AppModel: ObservableObject {
     private func handleDarwinWake(_ event: DarwinEvent) {
         guard isServiceReady else { return }
 
-        // The warm path is valid only while BOTH the foreground-started input
-        // engine and the separate silent output anchor are still alive. Darwin
-        // never attempts to restart microphone input from the background.
+        // Only live microphone flow decides whether the warm capture path is
+        // usable. The silent output anchor is a residency aid and can be
+        // restarted independently without touching microphone IO.
         if !backgroundWakeReady {
             bridgeAudioStage = .failed
             markBridgeChanged()
@@ -717,7 +717,17 @@ final class AppModel: ObservableObject {
             keyboardIsVisible = true
             keyboardHasBeenSeen = true
             activationHandoffInProgress = false
-            refreshVisibleKeyboardLease()
+
+            if microphoneCapture.isWarmReady {
+                refreshVisibleKeyboardLease()
+
+                // Route changes can stop playback while the mic tap keeps
+                // flowing. Playback-only restart is allowed here; never rebuild
+                // the microphone from a Darwin/background callback.
+                if !backgroundAnchor.isRunning {
+                    try? backgroundAnchor.start()
+                }
+            }
 
             if event == .heartbeat {
                 DarwinBus.post(.serviceChanged)
