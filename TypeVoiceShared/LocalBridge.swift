@@ -2,7 +2,7 @@ import Foundation
 
 enum LocalBridge {
     static let port = 14_558
-    static let protocolVersion = "4"
+    static let protocolVersion = "5"
     static let keyboardHeartbeatInterval: Duration = .seconds(2)
     static let resultValidity: TimeInterval = 300
 
@@ -16,6 +16,7 @@ enum BridgeAction: String, Codable, Sendable {
     case startRecording
     case stopRecording
     case cancelRecording
+    case retryProcessing
     case acknowledgeResult
 }
 
@@ -39,13 +40,25 @@ enum BridgeStatus: String, Codable, Sendable {
     case error
 }
 
+enum BridgeFailureKind: String, Codable, Sendable {
+    case audioStartFailed
+    case bridgeUnavailable
+    case transcriptionRecoverable
+    case transcriptionPermanent
+    case authRequired
+    case interrupted
+}
+
 struct BridgeState: Codable, Sendable {
     let serverID: String?
     let revision: UInt64
     let serviceReady: Bool
     let backgroundWakeReady: Bool
     let microphoneReady: Bool
+    let requestClaimed: Bool
     let status: BridgeStatus
+    let failureKind: BridgeFailureKind?
+    let retryAvailable: Bool
     let requestID: String?
     let transcribedText: String?
     let resultCreatedAt: Date?
@@ -58,7 +71,10 @@ struct BridgeState: Codable, Sendable {
         serviceReady: Bool,
         backgroundWakeReady: Bool = false,
         microphoneReady: Bool = false,
+        requestClaimed: Bool = false,
         status: BridgeStatus,
+        failureKind: BridgeFailureKind? = nil,
+        retryAvailable: Bool = false,
         requestID: String?,
         transcribedText: String?,
         resultCreatedAt: Date?,
@@ -70,7 +86,10 @@ struct BridgeState: Codable, Sendable {
         self.serviceReady = serviceReady
         self.backgroundWakeReady = backgroundWakeReady
         self.microphoneReady = microphoneReady
+        self.requestClaimed = requestClaimed
         self.status = status
+        self.failureKind = failureKind
+        self.retryAvailable = retryAvailable
         self.requestID = requestID
         self.transcribedText = transcribedText
         self.resultCreatedAt = resultCreatedAt
@@ -88,7 +107,10 @@ struct BridgeState: Codable, Sendable {
             serviceReady: false,
             backgroundWakeReady: false,
             microphoneReady: false,
+            requestClaimed: false,
             status: .idle,
+            failureKind: .bridgeUnavailable,
+            retryAvailable: false,
             requestID: nil,
             transcribedText: nil,
             resultCreatedAt: nil,
@@ -110,18 +132,22 @@ struct LocalBridgeClient: Sendable {
         self.session = session
     }
 
-    func fetchState() async throws -> BridgeState {
+    func fetchState(timeoutInterval: TimeInterval = 2) async throws -> BridgeState {
         var request = URLRequest(url: LocalBridge.stateURL)
         request.httpMethod = "GET"
-        request.timeoutInterval = 2
+        request.timeoutInterval = timeoutInterval
         request.setValue(LocalBridge.protocolVersion, forHTTPHeaderField: "X-TypeVoice-Protocol")
         return try await perform(request)
     }
 
-    func send(_ action: BridgeAction, requestID: String? = nil) async throws -> BridgeState {
+    func send(
+        _ action: BridgeAction,
+        requestID: String? = nil,
+        timeoutInterval: TimeInterval = 5
+    ) async throws -> BridgeState {
         var request = URLRequest(url: LocalBridge.commandURL)
         request.httpMethod = "POST"
-        request.timeoutInterval = 5
+        request.timeoutInterval = timeoutInterval
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(LocalBridge.protocolVersion, forHTTPHeaderField: "X-TypeVoice-Protocol")
         request.httpBody = try JSONEncoder().encode(
