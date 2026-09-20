@@ -19,6 +19,7 @@ enum TypeVoiceLanguage: String, CaseIterable, Identifiable {
 
 enum SharedKeys {
     static let interfaceLanguage = "typevoice.interfaceLanguage"
+    static let quickDictationEnabled = "typevoice.quickDictationEnabled"
     static let quickStandbySeconds = "typevoice.quickStandbySeconds"
     static let cleanupModel = "typevoice.cleanupModel"
 }
@@ -37,6 +38,15 @@ enum SharedStore {
         }
         set {
             defaults.set(newValue.rawValue, forKey: SharedKeys.interfaceLanguage)
+        }
+    }
+
+    static var quickDictationEnabled: Bool {
+        get {
+            defaults.bool(forKey: SharedKeys.quickDictationEnabled)
+        }
+        set {
+            defaults.set(newValue, forKey: SharedKeys.quickDictationEnabled)
         }
     }
 
