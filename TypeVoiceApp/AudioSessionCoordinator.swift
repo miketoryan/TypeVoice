@@ -120,12 +120,28 @@ final class AudioSessionCoordinator {
         try await applyHighestIntent(force: true)
     }
 
+    /// Fire-and-forget teardown for non-critical lifecycle exits.
     func reset() {
         activeIntents.removeAll()
         sessionIsActive = false
 
         Self.sessionQueue.async {
             try? AVAudioSession.sharedInstance().setActive(
+                false,
+                options: .notifyOthersOnDeactivation
+            )
+        }
+    }
+
+    /// Ordered teardown barrier used before a foreground cold rebuild.
+    /// Because this awaits the same serial session queue as setActive(true),
+    /// every older deactivate has finished before the new activation begins.
+    func resetAndWait() async {
+        activeIntents.removeAll()
+        sessionIsActive = false
+
+        try? await performSessionMutation {
+            try AVAudioSession.sharedInstance().setActive(
                 false,
                 options: .notifyOthersOnDeactivation
             )
