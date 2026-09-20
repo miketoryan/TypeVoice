@@ -484,13 +484,6 @@ final class KeyboardViewController: UIInputViewController {
 
         refreshUI()
 
-        if state.requestClaimed,
-           let requestID = state.requestID,
-           requestID == currentRequestID {
-            startFallbackTask?.cancel()
-            startFallbackTask = nil
-        }
-
         if state.status == .idle,
            state.requestID == nil {
             currentRequestID = nil
