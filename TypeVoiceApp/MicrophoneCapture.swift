@@ -12,8 +12,11 @@ final class MicrophoneCapture {
     private var receivedWarmBuffer = false
     private var receivedRecordingBuffer = false
     private var standbyExpiryTimestamp: TimeInterval = 0
+    private var standbyGeneration: UInt64 = 0
 
-    /// Fired on the main queue when the warm-idle window expires.
+    /// Fired on the main queue when the CURRENT warm-idle window expires.
+    /// A generation token prevents a delayed timeout callback from an older
+    /// session from tearing down a microphone that has already been re-warmed.
     var onStandbyExpired: (() -> Void)?
 
     /// True only while one dictation is being written to disk.
@@ -127,15 +130,19 @@ final class MicrophoneCapture {
     /// while the app is backgrounded.
     func setStandbyExpiry(after seconds: Int) {
         lock.lock()
+        standbyGeneration &+= 1
         if recordingFile == nil {
             standbyExpiryTimestamp = Date().timeIntervalSince1970
                 + TimeInterval(max(10, seconds))
+        } else {
+            standbyExpiryTimestamp = 0
         }
         lock.unlock()
     }
 
     func clearStandbyExpiry() {
         lock.lock()
+        standbyGeneration &+= 1
         standbyExpiryTimestamp = 0
         lock.unlock()
     }
@@ -176,6 +183,7 @@ final class MicrophoneCapture {
         recordingURL = url
         recordingFile = file
         receivedRecordingBuffer = false
+        standbyGeneration &+= 1
         standbyExpiryTimestamp = 0
         lock.unlock()
 
@@ -224,6 +232,7 @@ final class MicrophoneCapture {
         recordingURL = nil
         receivedWarmBuffer = false
         receivedRecordingBuffer = false
+        standbyGeneration &+= 1
         standbyExpiryTimestamp = 0
         lock.unlock()
 
@@ -261,7 +270,7 @@ final class MicrophoneCapture {
 
     private func consume(_ buffer: AVAudioPCMBuffer) {
         let now = Date().timeIntervalSince1970
-        var shouldExpire = false
+        var expiredGeneration: UInt64?
 
         lock.lock()
         receivedWarmBuffer = true
@@ -272,17 +281,34 @@ final class MicrophoneCapture {
         } else if standbyExpiryTimestamp > 0,
                   now >= standbyExpiryTimestamp {
             standbyExpiryTimestamp = 0
-            shouldExpire = true
+            expiredGeneration = standbyGeneration
         }
         // When recordingFile == nil, the warm tap deliberately discards the
         // buffer. Keeping the tap alive is what preserves background mic IO.
         lock.unlock()
 
-        if shouldExpire {
+        if let expiredGeneration {
             DispatchQueue.main.async { [weak self] in
-                self?.onStandbyExpired?()
+                self?.deliverStandbyExpiryIfCurrent(expiredGeneration)
             }
         }
+    }
+
+    private func deliverStandbyExpiryIfCurrent(_ generation: UInt64) {
+        lock.lock()
+        let isCurrent =
+            standbyGeneration == generation
+            && standbyExpiryTimestamp == 0
+            && recordingFile == nil
+        lock.unlock()
+
+        guard isCurrent else {
+            // A newer keyboard-visible lease, recording, warm-up, or shutdown
+            // superseded this callback before the main queue delivered it.
+            return
+        }
+
+        onStandbyExpired?()
     }
 }
 
