@@ -52,6 +52,10 @@ final class KeyboardViewController: UIInputViewController {
     private var hostBundleID: String?
     private var coldStartRequestID: String?
     private var foregroundRecoveryRequestID: String?
+    private var lastBridgeSuccessAt: Date?
+    private var darwinObservations: [DarwinObservation] = []
+
+    private let readinessLeaseSeconds: TimeInterval = 3
 
     private var heartbeatTask: Task<Void, Never>?
     private var pollingTask: Task<Void, Never>?
@@ -70,6 +74,7 @@ final class KeyboardViewController: UIInputViewController {
         keyboardVisible = true
         hostBundleID = HostApplicationResolver.lastCaptured
         coldStartRequestID = hostBundleID == nil ? nil : UUID().uuidString
+        startDarwinStateObservers()
         startBridgeTasks()
     }
 
@@ -83,6 +88,7 @@ final class KeyboardViewController: UIInputViewController {
         mayAutoInsert = false
         insertionScheduledForRequestID = nil
         stopBridgeTasks()
+        darwinObservations.removeAll()
         startFallbackTask?.cancel()
         startFallbackTask = nil
         hostResolveTask?.cancel()
@@ -99,6 +105,7 @@ final class KeyboardViewController: UIInputViewController {
         commandTask?.cancel()
         startFallbackTask?.cancel()
         hostResolveTask?.cancel()
+        darwinObservations.removeAll()
     }
 
     @objc private func microphoneTapped() {
@@ -348,6 +355,57 @@ final class KeyboardViewController: UIInputViewController {
         button.addTarget(self, action: action, for: .touchUpInside)
     }
 
+    private var bridgeLeaseIsFresh: Bool {
+        guard let lastBridgeSuccessAt else { return false }
+        return Date().timeIntervalSince(lastBridgeSuccessAt) <= readinessLeaseSeconds
+    }
+
+    private func startDarwinStateObservers() {
+        darwinObservations.removeAll()
+
+        darwinObservations = [
+            DarwinBus.observe(.statusChanged) { [weak self] in
+                Task { @MainActor in
+                    await self?.fetchState()
+                }
+            },
+            DarwinBus.observe(.resultReady) { [weak self] in
+                Task { @MainActor in
+                    await self?.fetchState()
+                }
+            },
+            DarwinBus.observe(.serviceChanged) { [weak self] in
+                Task { @MainActor in
+                    await self?.fetchState()
+                }
+            }
+        ]
+    }
+
+    private func darwinEvent(for action: BridgeAction) -> DarwinEvent? {
+        switch action {
+        case .heartbeat:
+            return .heartbeat
+        case .startRecording:
+            return .startRecording
+        case .stopRecording:
+            return .stopRecording
+        case .cancelRecording:
+            return .cancelRecording
+        case .retryProcessing:
+            return .retryProcessing
+        case .acknowledgeResult:
+            return .acknowledgeResult
+        case .state:
+            return nil
+        }
+    }
+
+    private func postDarwinWake(for action: BridgeAction) {
+        guard let event = darwinEvent(for: action) else { return }
+        DarwinBus.post(event)
+    }
+
     private func startBridgeTasks() {
         stopBridgeTasks()
 
@@ -393,8 +451,14 @@ final class KeyboardViewController: UIInputViewController {
     private func sendHeartbeat() async {
         guard keyboardVisible else { return }
 
+        postDarwinWake(for: .heartbeat)
+        try? await Task.sleep(for: .milliseconds(30))
+
         do {
-            let state = try await bridge.send(.heartbeat)
+            let state = try await bridge.send(
+                .heartbeat,
+                timeoutInterval: 0.8
+            )
             apply(state)
         } catch {
             applyConnectionFailure()
@@ -418,21 +482,26 @@ final class KeyboardViewController: UIInputViewController {
         commandTask = Task { @MainActor [weak self] in
             guard let self else { return }
 
-            do {
-                let state = try await self.bridge.send(
-                    action,
-                    requestID: requestID
+            for attempt in 0..<2 {
+                self.postDarwinWake(for: action)
+                try? await Task.sleep(
+                    for: attempt == 0 ? .milliseconds(35) : .milliseconds(90)
                 )
-                self.apply(state)
-            } catch {
-                self.latestState = .unavailable(
-                    self.localized(
-                        "TypeVoice 后台服务没有响应。",
-                        "TypeVoice background service did not respond."
-                    ),
-                    interfaceLanguage: self.latestState.interfaceLanguage
-                )
-                self.refreshUI()
+
+                do {
+                    let state = try await self.bridge.send(
+                        action,
+                        requestID: requestID,
+                        timeoutInterval: 0.9
+                    )
+                    self.apply(state)
+                    return
+                } catch {
+                    guard attempt == 0 else {
+                        self.applyConnectionFailure()
+                        return
+                    }
+                }
             }
         }
     }
@@ -446,16 +515,28 @@ final class KeyboardViewController: UIInputViewController {
         commandTask = Task { @MainActor [weak self] in
             guard let self else { return }
 
-            do {
-                let state = try await self.bridge.send(
-                    .startRecording,
-                    requestID: requestID,
-                    timeoutInterval: 1.0
+            for attempt in 0..<2 {
+                self.postDarwinWake(for: .startRecording)
+                try? await Task.sleep(
+                    for: attempt == 0 ? .milliseconds(40) : .milliseconds(110)
                 )
-                self.apply(state)
-            } catch {
-                // The independent 1.5 s claim window is already running.
-                // A lost HTTP response must not cause an immediate app switch.
+
+                do {
+                    let state = try await self.bridge.send(
+                        .startRecording,
+                        requestID: requestID,
+                        timeoutInterval: 0.55
+                    )
+                    self.apply(state)
+
+                    if state.requestID == requestID,
+                       state.requestClaimed {
+                        return
+                    }
+                } catch {
+                    // The independent claim window keeps running. Darwin is
+                    // posted again before the second payload attempt.
+                }
             }
         }
     }
@@ -477,6 +558,8 @@ final class KeyboardViewController: UIInputViewController {
                     return
                 }
 
+                self.postDarwinWake(for: .startRecording)
+
                 do {
                     let state = try await self.bridge.fetchState(
                         timeoutInterval: 0.25
@@ -493,7 +576,7 @@ final class KeyboardViewController: UIInputViewController {
                 }
 
                 do {
-                    try await Task.sleep(for: .milliseconds(120))
+                    try await Task.sleep(for: .milliseconds(220))
                 } catch {
                     return
                 }
@@ -542,6 +625,8 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func apply(_ state: BridgeState) {
+        lastBridgeSuccessAt = Date()
+
         if state.serverID == latestState.serverID,
            state.revision < latestState.revision {
             return
@@ -576,15 +661,6 @@ final class KeyboardViewController: UIInputViewController {
             foregroundRecoveryRequestID = nil
         }
 
-        if state.status == .error,
-           let requestID = state.requestID,
-           requestID == currentRequestID,
-           state.failureKind == .audioStartFailed
-            || state.failureKind == .bridgeUnavailable {
-            launchForegroundRecovery(requestID: requestID)
-            return
-        }
-
         if state.status == .idle,
            state.requestID == nil {
             currentRequestID = nil
@@ -609,16 +685,23 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func applyConnectionFailure() {
+        // Like VocaPhone's readiness lease: one missed local request is not
+        // enough to declare a warm background service dead.
+        if bridgeLeaseIsFresh {
+            return
+        }
+
         guard latestState.status != .recording,
               latestState.status != .transcribing,
-              latestState.status != .polishing else {
+              latestState.status != .polishing,
+              latestState.status != .starting else {
             return
         }
 
         latestState = .unavailable(
             localized(
-                "未连接 TypeVoice：正在准备冷启动。",
-                "TypeVoice is not connected. Preparing cold launch."
+                "后台状态已过期 · 点击麦克风会先尝试 Darwin 唤醒",
+                "Background status expired · tap the microphone to try a Darwin wake first"
             ),
             interfaceLanguage: latestState.interfaceLanguage
         )
@@ -630,22 +713,21 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func refreshUI() {
-        let isColdState = hasFullAccess && !latestState.serviceReady
-        let hasReturnTarget = hostBundleID != nil
-        let shouldUseColdStartLink = isColdState && hasReturnTarget
-
         if hostBundleID != nil, coldStartRequestID == nil {
             coldStartRequestID = UUID().uuidString
         }
 
+        // Even if the last lease expired, the normal microphone button gets the
+        // first attempt. URL launch is reserved for an unclaimed request after
+        // the Darwin+LocalBridge warm window actually fails.
         coldStartHost?.rootView = ColdStartMicLink(
             isEnglish: latestState.interfaceLanguage == "en",
             hostBundleID: hostBundleID,
             requestID: coldStartRequestID ?? "pending"
         )
-        coldStartHost?.view.isHidden = !shouldUseColdStartLink
-        micButton.isHidden = shouldUseColdStartLink
-        micButton.isUserInteractionEnabled = !isColdState
+        coldStartHost?.view.isHidden = true
+        micButton.isHidden = false
+        micButton.isUserInteractionEnabled = true
 
         guard hasFullAccess else {
             statusLabel.text = localized(
@@ -676,46 +758,24 @@ final class KeyboardViewController: UIInputViewController {
             return
         }
 
-        guard latestState.serviceReady else {
-            if hostBundleID == nil {
-                statusLabel.text = localized(
-                    "正在识别当前输入应用…",
-                    "Identifying the current app…"
-                )
-                micButton.setTitle(
-                    localized("正在准备…", "Preparing…"),
-                    for: .normal
-                )
-                micButton.backgroundColor = .systemGray.withAlphaComponent(0.18)
-
-                if hostResolveTask == nil || hostResolveTask?.isCancelled == true {
-                    resolveHostApplicationWithRetries()
-                }
-            } else {
-                statusLabel.text = latestState.lastError ?? localized(
-                    "未待命 · 点击麦克风短暂打开 TypeVoice",
-                    "Not ready · tap the microphone to briefly open TypeVoice"
-                )
-                micButton.setTitle(
-                    localized("🎙 开始语音", "🎙 Speak"),
-                    for: .normal
-                )
-                micButton.backgroundColor = .systemBlue.withAlphaComponent(0.14)
-            }
-            return
-        }
-
         switch latestState.status {
         case .idle:
-            statusLabel.text = latestState.backgroundWakeReady
-                ? localized(
-                    "后台已待命 · 点击后启动麦克风",
-                    "Ready in background · tap to start the microphone"
+            if latestState.serviceReady && bridgeLeaseIsFresh {
+                statusLabel.text = latestState.backgroundWakeReady
+                    ? localized(
+                        "后台已待命 · Darwin 通道在线",
+                        "Ready in background · Darwin channel online"
+                    )
+                    : localized(
+                        "后台服务在线 · 点击后先 Darwin 唤醒",
+                        "Background service online · Darwin wake will run first"
+                    )
+            } else {
+                statusLabel.text = localized(
+                    "后台状态待确认 · 点击会先尝试无跳转唤醒",
+                    "Background state unconfirmed · tap to try a no-switch wake first"
                 )
-                : localized(
-                    "后台服务在线 · 点击后直接尝试启动麦克风",
-                    "Background service online · tap to start the microphone"
-                )
+            }
             micButton.setTitle(
                 localized("🎙 开始语音", "🎙 Speak"),
                 for: .normal
