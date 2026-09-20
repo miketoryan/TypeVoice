@@ -116,6 +116,18 @@ final class AppModel: ObservableObject {
                 isChatGPTLoggedIn = true
                 chatGPTAccountSummary = Self.accountSummary(tokens)
                 lastError = nil
+
+                if bridgeStatus == .error,
+                   bridgeFailureKind == .authRequired,
+                   let requestID = activeRequestID,
+                   preservedAudioRequestID == requestID,
+                   let preservedAudioURL,
+                   FileManager.default.fileExists(atPath: preservedAudioURL.path) {
+                    bridgeFailureKind = .transcriptionRecoverable
+                    bridgeRetryAvailable = true
+                    bridgeError = "Signed in. Return to the keyboard and retry transcription."
+                    markBridgeChanged()
+                }
             } catch is CancellationError {
                 isLoggingIn = false
             } catch {
