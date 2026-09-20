@@ -112,14 +112,6 @@ final class AudioSessionCoordinator {
         try await applyHighestIntent()
     }
 
-    /// Reserved for a real audio-system interruption/reset. Normal microphone
-    /// retries must not use this because a forced category mutation from the
-    /// background is exactly the transition TypeVoice is trying to avoid.
-    func reassertCurrentProfile() async throws {
-        sessionIsActive = false
-        try await applyHighestIntent(force: true)
-    }
-
     /// Fire-and-forget teardown for non-critical lifecycle exits.
     func reset() {
         activeIntents.removeAll()
