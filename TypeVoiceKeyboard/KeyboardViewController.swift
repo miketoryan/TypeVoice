@@ -113,7 +113,7 @@ final class KeyboardViewController: UIInputViewController {
             return
         }
 
-        guard latestState.serviceReady else {
+        guard latestState.backgroundWakeReady else {
             let requestID = coldStartRequestID ?? UUID().uuidString
             coldStartRequestID = requestID
             openContainingApp(requestID: requestID)
@@ -425,6 +425,7 @@ final class KeyboardViewController: UIInputViewController {
             serverID: latestState.serverID,
             revision: latestState.revision &+ 1,
             serviceReady: true,
+            backgroundWakeReady: latestState.backgroundWakeReady,
             microphoneReady: latestState.microphoneReady,
             status: .starting,
             requestID: requestID,
@@ -467,7 +468,6 @@ final class KeyboardViewController: UIInputViewController {
         }
 
         if state.status == .error,
-           !state.microphoneReady,
            let requestID = state.requestID,
            requestID == currentRequestID {
             launchForegroundRecovery(requestID: requestID)
@@ -512,7 +512,7 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func refreshUI() {
-        let isColdState = hasFullAccess && !latestState.serviceReady
+        let isColdState = hasFullAccess && !latestState.backgroundWakeReady
         let hasReturnTarget = hostBundleID != nil
         let shouldUseColdStartLink = isColdState && hasReturnTarget
 
@@ -558,7 +558,7 @@ final class KeyboardViewController: UIInputViewController {
             return
         }
 
-        guard latestState.serviceReady else {
+        guard latestState.backgroundWakeReady else {
             if hostBundleID == nil {
                 statusLabel.text = localized(
                     "正在识别当前输入应用…",
@@ -589,15 +589,10 @@ final class KeyboardViewController: UIInputViewController {
 
         switch latestState.status {
         case .idle:
-            statusLabel.text = latestState.microphoneReady
-                ? localized(
-                    "已待命 · 点击麦克风直接说",
-                    "Ready · tap the microphone"
-                )
-                : localized(
-                    "服务在线 · 点击后先尝试恢复麦克风",
-                    "Service online · tap to recover the microphone"
-                )
+            statusLabel.text = localized(
+                "后台已待命 · 点击后启动麦克风",
+                "Ready in background · tap to start the microphone"
+            )
             micButton.setTitle(
                 localized("🎙 开始语音", "🎙 Speak"),
                 for: .normal
@@ -822,6 +817,7 @@ final class KeyboardViewController: UIInputViewController {
                     serverID: self.latestState.serverID,
                     revision: self.latestState.revision &+ 1,
                     serviceReady: self.latestState.serviceReady,
+                    backgroundWakeReady: self.latestState.backgroundWakeReady,
                     microphoneReady: self.latestState.microphoneReady,
                     status: .idle,
                     requestID: nil,
