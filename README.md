@@ -42,14 +42,15 @@ Apple does not allow a custom keyboard extension to access the microphone direct
 - Darwin notifications for lightweight cross-process start/stop/result signals;
 - `UITextDocumentProxy` in the keyboard extension for direct insertion.
 
-When the audio service is warm and its heartbeat is fresh, tapping the keyboard microphone does not open TypeVoice. If iOS has suspended the containing app, or the warm window has expired, the keyboard falls back to opening TypeVoice so the audio session can be prepared again.
+In the v0.20 ActiveSession experiment, TypeVoice starts one AVAudioEngine while the containing app is foregrounded. Standby keeps only a looping silent output path alive; the microphone input tap is absent. A keyboard dictation attaches the input tap to that already-running engine and removes it again when recording stops. This specifically avoids calling AVAudioEngine.start() from the background between dictations. If iOS has invalidated the running audio graph, the keyboard falls back to opening TypeVoice so the graph can be rebuilt in the foreground.
 
 ## Current scope — v0.1
 
 - iOS 16+
 - TypeVoice app + custom keyboard extension
-- background-ready microphone service
-- warm start / cold-start fallback
+- background-ready output-only ActiveSession service
+- input-tap start/stop without background AVAudioEngine restart
+- foreground recovery fallback when the active graph is invalidated
 - OpenAI transcription (default model is configurable)
 - OpenAI text cleanup (default model is configurable)
 - automatic language detection by speech/model pipeline
@@ -86,7 +87,7 @@ In Xcode:
 
 Audio is captured by the TypeVoice containing app. In the default configuration it is uploaded to the configured OpenAI-compatible API for transcription, and the resulting transcript is sent for cleanup. TypeVoice does not intentionally send text from the host app to the model.
 
-The microphone may remain active during the configured Quick Dictation ready window so iOS can keep the containing app eligible for background audio execution. iOS will show its normal microphone privacy indicator while the microphone session is active.
+The v0.20 design keeps background execution alive with silent output while no input tap is installed during standby. The microphone path is attached only during an actual dictation and removed immediately afterwards. iOS still controls the privacy indicator and may change audio-session behavior across OS versions, so this behavior is being validated on real devices.
 
 ## Design references
 
