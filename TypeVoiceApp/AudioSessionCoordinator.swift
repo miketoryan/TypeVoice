@@ -134,8 +134,13 @@ final class AudioSessionCoordinator {
     }
 
     /// Configure once while TypeVoice is foregrounded/armed, then keep this
-    /// exact profile active while the service is alive. Microphone privacy is
-    /// controlled by AVAudioEngine/input-tap lifetime, not by changing category.
+    /// exact profile active while the service is alive. Do NOT mix with other
+    /// app audio: activating TypeVoice should interrupt/pause music so speech
+    /// capture is not contaminated. When the warm session is released, reset()
+    /// deactivates with notifyOthersOnDeactivation so interrupted audio may resume.
+    ///
+    /// Microphone privacy is controlled by AVAudioEngine/input-tap lifetime,
+    /// not by changing category during background capture.
     private var persistentProfile: (
         category: AVAudioSession.Category,
         mode: AVAudioSession.Mode,
@@ -144,7 +149,7 @@ final class AudioSessionCoordinator {
         (
             .playAndRecord,
             .default,
-            [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]
+            [.defaultToSpeaker, .allowBluetooth]
         )
     }
 
