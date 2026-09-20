@@ -50,7 +50,6 @@ final class AppModel: ObservableObject {
     private var pendingKeyboardActivation: PendingKeyboardActivation?
     private var keyboardIsVisible = false
     private var keyboardHasBeenSeen = false
-    private var activationHandoffInProgress = false
     private var darwinObservations: [DarwinObservation] = []
 
     init() {
@@ -262,7 +261,6 @@ final class AppModel: ObservableObject {
         activationResolutionTask?.cancel()
         activationResolutionTask = nil
         pendingKeyboardActivation = nil
-        activationHandoffInProgress = false
 
         microphoneCapture.shutdown()
         backgroundAnchor.stop()
@@ -311,7 +309,6 @@ final class AppModel: ObservableObject {
         // the app has already become active. appBecameActive() is the primary
         // consumer; the explicit active check handles the inverse event ordering
         // where scene activation wins the race and the URL arrives second.
-        activationHandoffInProgress = true
         pendingKeyboardActivation = PendingKeyboardActivation(
             requestID: requestedRecordingID,
             hostBundleID: requestedHostBundleID,
@@ -380,7 +377,6 @@ final class AppModel: ObservableObject {
             if self.pendingKeyboardActivation?.requestID == pending.requestID {
                 self.pendingKeyboardActivation = nil
             }
-            self.activationHandoffInProgress = false
             self.activationResolutionTask = nil
 
             // If a newer request arrived while this one was resolving, consume it
@@ -588,7 +584,7 @@ final class AppModel: ObservableObject {
         }
 
         if keyboardIsVisible {
-            refreshVisibleKeyboardLease()
+            microphoneCapture.clearStandbyExpiry()
         } else if keyboardHasBeenSeen {
             scheduleStandbyExpiry()
         } else {
@@ -609,21 +605,6 @@ final class AppModel: ObservableObject {
 
         microphoneCapture.setStandbyExpiry(
             after: max(10, SharedStore.quickStandbySeconds)
-        )
-    }
-
-    /// While the keyboard is visible, refresh a slightly longer fail-safe lease
-    /// on every heartbeat. The explicit keyboardHidden signal replaces this with
-    /// the exact selected duration at the moment the keyboard actually exits.
-    private func refreshVisibleKeyboardLease() {
-        guard isServiceReady,
-              !microphoneCapture.isRecording else {
-            return
-        }
-
-        let heartbeatGrace = 4
-        microphoneCapture.setStandbyExpiry(
-            after: max(10, SharedStore.quickStandbySeconds) + heartbeatGrace
         )
     }
 
@@ -670,10 +651,8 @@ final class AppModel: ObservableObject {
         darwinObservations.removeAll()
 
         let events: [DarwinEvent] = [
-            .heartbeat,
             .keyboardVisible,
             .keyboardHidden,
-            .activationHandoffBegan,
             .startRecording,
             .stopRecording,
             .cancelRecording,
@@ -705,58 +684,38 @@ final class AppModel: ObservableObject {
         }
 
         switch event {
-        case .activationHandoffBegan:
-            // Opening TypeVoice from the keyboard temporarily makes the keyboard
-            // disappear. That is NOT a user exit and must not start the standby
-            // countdown or disturb the foreground activation/return sequence.
-            activationHandoffInProgress = true
-            keyboardIsVisible = false
-            microphoneCapture.clearStandbyExpiry()
-
-        case .keyboardVisible, .heartbeat:
+        case .keyboardVisible:
             keyboardIsVisible = true
             keyboardHasBeenSeen = true
-            activationHandoffInProgress = false
 
-            if microphoneCapture.isWarmReady {
-                refreshVisibleKeyboardLease()
+            // While the TypeVoice keyboard is visible there is no standby
+            // countdown. The selected 10s/30s/1m/5m window starts only when the
+            // keyboard actually disappears.
+            microphoneCapture.clearStandbyExpiry()
 
-                // Route changes can stop playback while the mic tap keeps
-                // flowing. Playback-only restart is allowed here; never rebuild
-                // the microphone from a Darwin/background callback.
-                if !backgroundAnchor.isRunning {
-                    try? backgroundAnchor.start()
-                }
-            }
-
-            if event == .heartbeat {
-                DarwinBus.post(.serviceChanged)
+            // Silent playback is only a finite-window residency aid. Restart it
+            // independently if a route change stopped it; never rebuild mic IO
+            // from this background/Darwin callback.
+            if microphoneCapture.isWarmReady,
+               !backgroundAnchor.isRunning {
+                try? backgroundAnchor.start()
             }
 
         case .keyboardHidden:
             keyboardIsVisible = false
             keyboardHasBeenSeen = true
-
-            if activationHandoffInProgress {
-                microphoneCapture.clearStandbyExpiry()
-            } else {
-                scheduleStandbyExpiry()
-            }
+            scheduleStandbyExpiry()
             DarwinBus.post(.serviceChanged)
 
         default:
             break
+        }
         }
     }
 
     private func handleBridgeRequest(_ request: BridgeRequest) async -> BridgeState {
         switch request.action {
         case .state:
-            break
-
-        case .heartbeat:
-            // Heartbeat reports the already-warm input graph. It never rebuilds
-            // microphone input from the background.
             break
 
         case .startRecording:
@@ -888,7 +847,7 @@ final class AppModel: ObservableObject {
                 microphoneCapture.discardRecording()
                 try? await audioSessionCoordinator.endAndWait(.capture)
                 if keyboardIsVisible {
-                    refreshVisibleKeyboardLease()
+                    microphoneCapture.clearStandbyExpiry()
                 }
                 return false
             }
@@ -909,7 +868,7 @@ final class AppModel: ObservableObject {
             microphoneCapture.discardRecording()
             try? await audioSessionCoordinator.endAndWait(.capture)
             if backgroundWakeReady, keyboardIsVisible {
-                refreshVisibleKeyboardLease()
+                microphoneCapture.clearStandbyExpiry()
             }
 
             guard activeRequestID == requestID else { return false }
@@ -953,7 +912,7 @@ final class AppModel: ObservableObject {
 
         try? await audioSessionCoordinator.endAndWait(.capture)
         if keyboardIsVisible {
-            refreshVisibleKeyboardLease()
+            microphoneCapture.clearStandbyExpiry()
         }
 
         discardPreservedAudio()
@@ -1024,7 +983,7 @@ final class AppModel: ObservableObject {
         }
 
         if backgroundWakeReady, keyboardIsVisible {
-            refreshVisibleKeyboardLease()
+            microphoneCapture.clearStandbyExpiry()
         }
 
         discardPreservedAudio()
