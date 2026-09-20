@@ -70,7 +70,7 @@ final class AppModel: ObservableObject {
                 DarwinBus.post(.serviceChanged)
 
                 if let interruptedRequestID,
-                   self.bridgeStatus == .recording || self.bridgeStatus == .starting {
+                   (self.bridgeStatus == .recording || self.bridgeStatus == .starting) {
                     self.publishBridgeError(
                         "The iPhone audio service restarted. Tap the microphone to try again.",
                         requestID: interruptedRequestID,
@@ -355,8 +355,7 @@ final class AppModel: ObservableObject {
     /// An already-warm idle session adopts the new duration starting now.
     func updateStandbyDuration() {
         guard isServiceReady,
-              bridgeStatus != .recording,
-              bridgeStatus != .starting else {
+              !microphoneCapture.isRecording else {
             return
         }
         scheduleStandbyExpiry()
@@ -372,8 +371,7 @@ final class AppModel: ObservableObject {
         standbyExpiryTask = nil
 
         guard isServiceReady,
-              bridgeStatus != .recording,
-              bridgeStatus != .starting else {
+              !microphoneCapture.isRecording else {
             return
         }
 
@@ -387,8 +385,7 @@ final class AppModel: ObservableObject {
 
             guard let self,
                   self.isServiceReady,
-                  self.bridgeStatus != .recording,
-                  self.bridgeStatus != .starting else {
+                  !self.microphoneCapture.isRecording else {
                 return
             }
 
