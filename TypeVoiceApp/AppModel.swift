@@ -38,6 +38,8 @@ final class AppModel: ObservableObject {
     private var loginTask: Task<Void, Never>?
     private var recordingStartTask: Task<Bool, Never>?
     private var recordingStartRequestID: String?
+    private var keyboardIsVisible = false
+    private var keyboardHasBeenSeen = false
     private var darwinObservations: [DarwinObservation] = []
 
     init() {
@@ -208,7 +210,7 @@ final class AppModel: ObservableObject {
             resetBridgeToIdle(clearRequest: true)
             bridgeAudioStage = .standbySessionReady
             lastError = nil
-            scheduleStandbyExpiry()
+            microphoneCapture.clearStandbyExpiry()
             markBridgeChanged()
             DarwinBus.post(.serviceChanged)
         } catch {
@@ -269,7 +271,7 @@ final class AppModel: ObservableObject {
                     try await audioSessionCoordinator.reassertCurrentProfile()
                     try await microphoneCapture.warmUp()
                     try backgroundAnchor.start()
-                    scheduleStandbyExpiry()
+                    microphoneCapture.clearStandbyExpiry()
                     bridgeAudioStage = .standbySessionReady
                     lastError = nil
                     markBridgeChanged()
@@ -335,7 +337,7 @@ final class AppModel: ObservableObject {
                 try await audioSessionCoordinator.reassertCurrentProfile()
                 try await microphoneCapture.warmUp()
                 try backgroundAnchor.start()
-                scheduleStandbyExpiry()
+                microphoneCapture.clearStandbyExpiry()
                 bridgeAudioStage = .standbySessionReady
                 lastError = nil
                 markBridgeChanged()
@@ -348,13 +350,22 @@ final class AppModel: ObservableObject {
     }
 
     /// Called when the user changes 10 s / 30 s / 1 min / 5 min in Settings.
-    /// An already-warm idle session adopts the new duration starting now.
+    /// The selected duration is defined as time AFTER leaving the TypeVoice
+    /// keyboard. While the keyboard remains visible, no user-facing standby
+    /// countdown is allowed to expire.
     func updateStandbyDuration() {
         guard isServiceReady,
               !microphoneCapture.isRecording else {
             return
         }
-        scheduleStandbyExpiry()
+
+        if keyboardIsVisible {
+            refreshVisibleKeyboardLease()
+        } else if keyboardHasBeenSeen {
+            scheduleStandbyExpiry()
+        } else {
+            microphoneCapture.clearStandbyExpiry()
+        }
     }
 
     private var backgroundWakeReady: Bool {
@@ -370,6 +381,21 @@ final class AppModel: ObservableObject {
 
         microphoneCapture.setStandbyExpiry(
             after: max(10, SharedStore.quickStandbySeconds)
+        )
+    }
+
+    /// While the keyboard is visible, refresh a slightly longer fail-safe lease
+    /// on every heartbeat. The explicit keyboardHidden signal replaces this with
+    /// the exact selected duration at the moment the keyboard actually exits.
+    private func refreshVisibleKeyboardLease() {
+        guard isServiceReady,
+              !microphoneCapture.isRecording else {
+            return
+        }
+
+        let heartbeatGrace = 4
+        microphoneCapture.setStandbyExpiry(
+            after: max(10, SharedStore.quickStandbySeconds) + heartbeatGrace
         )
     }
 
@@ -417,6 +443,8 @@ final class AppModel: ObservableObject {
 
         let events: [DarwinEvent] = [
             .heartbeat,
+            .keyboardVisible,
+            .keyboardHidden,
             .startRecording,
             .stopRecording,
             .cancelRecording,
@@ -447,8 +475,24 @@ final class AppModel: ObservableObject {
             markBridgeChanged()
         }
 
-        if event == .heartbeat {
+        switch event {
+        case .keyboardVisible, .heartbeat:
+            keyboardIsVisible = true
+            keyboardHasBeenSeen = true
+            refreshVisibleKeyboardLease()
+
+            if event == .heartbeat {
+                DarwinBus.post(.serviceChanged)
+            }
+
+        case .keyboardHidden:
+            keyboardIsVisible = false
+            keyboardHasBeenSeen = true
+            scheduleStandbyExpiry()
             DarwinBus.post(.serviceChanged)
+
+        default:
+            break
         }
     }
 
@@ -590,7 +634,9 @@ final class AppModel: ObservableObject {
                   !Task.isCancelled else {
                 microphoneCapture.discardRecording()
                 try? await audioSessionCoordinator.endAndWait(.capture)
-                scheduleStandbyExpiry()
+                if keyboardIsVisible {
+                    refreshVisibleKeyboardLease()
+                }
                 return false
             }
 
@@ -609,8 +655,8 @@ final class AppModel: ObservableObject {
         } catch {
             microphoneCapture.discardRecording()
             try? await audioSessionCoordinator.endAndWait(.capture)
-            if backgroundWakeReady {
-                scheduleStandbyExpiry()
+            if backgroundWakeReady, keyboardIsVisible {
+                refreshVisibleKeyboardLease()
             }
 
             guard activeRequestID == requestID else { return false }
@@ -653,7 +699,9 @@ final class AppModel: ObservableObject {
         }
 
         try? await audioSessionCoordinator.endAndWait(.capture)
-        scheduleStandbyExpiry()
+        if keyboardIsVisible {
+            refreshVisibleKeyboardLease()
+        }
 
         discardPreservedAudio()
         preservedAudioURL = fileURL
@@ -722,8 +770,8 @@ final class AppModel: ObservableObject {
             try? await audioSessionCoordinator.endAndWait(.capture)
         }
 
-        if backgroundWakeReady {
-            scheduleStandbyExpiry()
+        if backgroundWakeReady, keyboardIsVisible {
+            refreshVisibleKeyboardLease()
         }
 
         discardPreservedAudio()
