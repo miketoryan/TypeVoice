@@ -6,9 +6,6 @@ struct ContentView: View {
     @AppStorage(SharedKeys.interfaceLanguage, store: SharedStore.defaults)
     private var languageRaw = TypeVoiceLanguage.chinese.rawValue
 
-    @AppStorage(SharedKeys.quickStandbySeconds, store: SharedStore.defaults)
-    private var quickStandbySeconds = 60
-
     private var isChinese: Bool {
         languageRaw != TypeVoiceLanguage.english.rawValue
     }
@@ -96,8 +93,8 @@ struct ContentView: View {
                     Text(text("语音服务", "Voice service"))
                 } footer: {
                     Text(text(
-                        "快速语音开启后，TypeVoice 会保持后台录音服务待命。服务已就绪时，从键盘点击麦克风不会离开当前 App。",
-                        "When Quick Dictation is enabled, TypeVoice keeps its background recording service ready. If ready, tapping the keyboard microphone stays in the current app."
+                        "快速语音开启后，TypeVoice 在后台保持可唤醒状态，但麦克风平时关闭。点击键盘麦克风时才启动录音，结束后立即关闭麦克风。",
+                        "When Quick Dictation is enabled, TypeVoice stays wake-ready in the background while the microphone remains off. The microphone starts only when you tap Speak and turns off immediately when you finish."
                     ))
                 }
 
@@ -107,11 +104,11 @@ struct ContentView: View {
                         Text("English").tag(TypeVoiceLanguage.english.rawValue)
                     }
 
-                    Picker(text("待命时长", "Ready window"), selection: $quickStandbySeconds) {
-                        Text(text("10 秒", "10 seconds")).tag(10)
-                        Text(text("30 秒", "30 seconds")).tag(30)
-                        Text(text("1 分钟", "1 minute")).tag(60)
-                        Text(text("5 分钟", "5 minutes")).tag(300)
+                    HStack {
+                        Text(text("后台待命", "Background readiness"))
+                        Spacer()
+                        Text(text("直到关闭快速语音", "Until Quick Dictation is disabled"))
+                            .foregroundColor(.secondary)
                     }
                 } header: {
                     Text(text("使用设置", "Usage"))
@@ -188,7 +185,7 @@ struct ContentView: View {
         case .transcribing, .polishing:
             return text("完成后会自动插入当前输入框。", "The result will be inserted automatically.")
         case .ready:
-            return text("可以直接从键盘开始语音。", "Ready for keyboard dictation.")
+            return text("后台已待命，麦克风当前关闭；从键盘点击即可启动。", "Background ready; the microphone is off until you tap it from the keyboard.")
         default:
             return text("开启快速语音后即可使用。", "Enable Quick Dictation to begin.")
         }
