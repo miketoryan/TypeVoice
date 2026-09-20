@@ -12,6 +12,7 @@ final class AppModel: ObservableObject {
     }
 
     @Published private(set) var status: TypeVoiceStatus = .idle
+    @Published private(set) var isQuickDictationEnabled = SharedStore.quickDictationEnabled
     @Published private(set) var isServiceReady = false
     @Published private(set) var lastTranscript: String?
     @Published private(set) var lastError: String?
@@ -228,6 +229,8 @@ final class AppModel: ObservableObject {
             try await microphoneCapture.warmUp()
             try backgroundAnchor.start()
 
+            isQuickDictationEnabled = true
+            SharedStore.quickDictationEnabled = true
             isServiceReady = true
             status = .ready
             resetBridgeToIdle(clearRequest: true)
@@ -267,6 +270,8 @@ final class AppModel: ObservableObject {
         audioSessionCoordinator.reset()
         discardPreservedAudio()
 
+        isQuickDictationEnabled = false
+        SharedStore.quickDictationEnabled = false
         isServiceReady = false
         status = .idle
         resetBridgeToIdle(clearRequest: true)
@@ -301,6 +306,15 @@ final class AppModel: ObservableObject {
                 retryAvailable: false,
                 claimed: false
             )
+            return
+        }
+
+        guard isQuickDictationEnabled else {
+            pendingKeyboardActivation = nil
+            lastError = "Quick Dictation is disabled. Enable it in TypeVoice first."
+            status = .idle
+            markBridgeChanged()
+            DarwinBus.post(.serviceChanged)
             return
         }
 
@@ -1260,6 +1274,7 @@ final class AppModel: ObservableObject {
             serverID: serverID,
             revision: bridgeRevision,
             serviceReady: isServiceReady,
+            quickDictationEnabled: isQuickDictationEnabled,
             backgroundWakeReady: backgroundWakeReady,
             microphoneReady: microphoneCapture.isWarmReady,
             requestClaimed: bridgeRequestClaimed,
