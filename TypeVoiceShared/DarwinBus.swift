@@ -1,9 +1,19 @@
 import Foundation
 
 enum DarwinEvent: String {
+    // Keyboard -> containing app. These notifications are intentionally
+    // payload-free wake signals. Request data still travels through LocalBridge,
+    // because TypeVoice's AltServer/free-signing path cannot rely on App Groups.
+    case heartbeat = "com.miketoryan.typevoice.heartbeat"
     case startRecording = "com.miketoryan.typevoice.startRecording"
     case stopRecording = "com.miketoryan.typevoice.stopRecording"
     case cancelRecording = "com.miketoryan.typevoice.cancelRecording"
+    case retryProcessing = "com.miketoryan.typevoice.retryProcessing"
+    case acknowledgeResult = "com.miketoryan.typevoice.acknowledgeResult"
+
+    // Containing app -> keyboard. The keyboard still reads the authoritative
+    // BridgeState from LocalBridge after receiving one of these lightweight
+    // cross-process nudges.
     case statusChanged = "com.miketoryan.typevoice.statusChanged"
     case resultReady = "com.miketoryan.typevoice.resultReady"
     case serviceChanged = "com.miketoryan.typevoice.serviceChanged"
@@ -54,7 +64,10 @@ enum DarwinBus {
         )
     }
 
-    static func observe(_ event: DarwinEvent, handler: @escaping () -> Void) -> DarwinObservation {
+    static func observe(
+        _ event: DarwinEvent,
+        handler: @escaping () -> Void
+    ) -> DarwinObservation {
         DarwinObservation(event: event, handler: handler)
     }
 }
