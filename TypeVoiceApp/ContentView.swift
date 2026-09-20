@@ -93,8 +93,8 @@ struct ContentView: View {
                     Text(text("语音服务", "Voice service"))
                 } footer: {
                     Text(text(
-                        "快速语音开启后，TypeVoice 在后台保持可唤醒状态，但麦克风平时关闭。点击键盘麦克风时才启动录音，结束后立即关闭麦克风。",
-                        "When Quick Dictation is enabled, TypeVoice stays wake-ready in the background while the microphone remains off. The microphone starts only when you tap Speak and turns off immediately when you finish."
+                        "实验版：快速语音开启时，TypeVoice 会让输入音频引擎保持待机，点击键盘后只开始保存语音，不再从后台重新启动 AVAudioEngine。这样用于验证能否彻底避免跳转。由于输入引擎保持运行，iOS 可能持续显示麦克风使用指示。",
+                        "Experimental build: while Quick Dictation is enabled, TypeVoice keeps the input audio engine warm. Tapping Speak only starts saving audio; it no longer starts AVAudioEngine from the background. This tests whether app switching can be eliminated. iOS may continue showing the microphone privacy indicator while the input engine stays warm."
                     ))
                 }
 
@@ -185,7 +185,7 @@ struct ContentView: View {
         case .transcribing, .polishing:
             return text("完成后会自动插入当前输入框。", "The result will be inserted automatically.")
         case .ready:
-            return text("后台已待命，麦克风当前关闭；从键盘点击即可启动。", "Background ready; the microphone is off until you tap it from the keyboard.")
+            return text("后台 warm engine 已待命；键盘点击只打开录音写入，不再后台启动引擎。", "Warm input engine is ready; the keyboard only opens the recording gate instead of starting the engine in background.")
         default:
             return text("开启快速语音后即可使用。", "Enable Quick Dictation to begin.")
         }
