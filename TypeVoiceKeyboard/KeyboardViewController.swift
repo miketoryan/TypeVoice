@@ -249,6 +249,7 @@ final class KeyboardViewController: UIInputViewController {
         ])
         coldHost.didMove(toParent: self)
         coldStartHost = coldHost
+    }
 
     private func resolveHostApplicationWithRetries() {
         hostResolveTask?.cancel()
