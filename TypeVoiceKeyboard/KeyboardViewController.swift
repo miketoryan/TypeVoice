@@ -150,10 +150,15 @@ final class KeyboardViewController: UIInputViewController {
                 )
 
             case .audioStartFailed, .bridgeUnavailable:
-                if let requestID = latestState.requestID ?? currentRequestID {
-                    launchForegroundRecovery(requestID: requestID)
+                if hostBundleID == nil {
+                    resolveHostApplicationWithRetries()
+                    statusLabel.text = localized(
+                        "正在识别当前输入应用…",
+                        "Identifying the current app…"
+                    )
                 } else {
-                    startRecordingRequest()
+                    // The visible control is a real SwiftUI Link in refreshUI().
+                    refreshUI()
                 }
 
             case .authRequired:
@@ -250,7 +255,8 @@ final class KeyboardViewController: UIInputViewController {
             rootView: ColdStartMicLink(
                 isEnglish: latestState.interfaceLanguage == "en",
                 hostBundleID: hostBundleID,
-                requestID: coldStartRequestID ?? UUID().uuidString
+                requestID: coldStartRequestID ?? UUID().uuidString,
+                mode: .speak
             )
         )
         coldHost.view.translatesAutoresizingMaskIntoConstraints = false
@@ -717,17 +723,29 @@ final class KeyboardViewController: UIInputViewController {
             coldStartRequestID = UUID().uuidString
         }
 
-        // Even if the last lease expired, the normal microphone button gets the
-        // first attempt. URL launch is reserved for an unclaimed request after
-        // the Darwin+LocalBridge warm window actually fails.
+        let recoveryRequestID = latestState.requestID ?? currentRequestID
+        let shouldShowRecoveryLink =
+            latestState.status == .error
+            && (
+                latestState.failureKind == .audioStartFailed
+                || latestState.failureKind == .bridgeUnavailable
+                || latestState.failureKind == .interrupted
+            )
+            && hostBundleID != nil
+            && recoveryRequestID != nil
+
+        // Normal dictation always gets the warm no-switch attempt first.
+        // After a warm audio failure, the center control becomes a *real*
+        // user-tapped SwiftUI Link. No hidden openURL or 600 ms retry is involved.
         coldStartHost?.rootView = ColdStartMicLink(
             isEnglish: latestState.interfaceLanguage == "en",
             hostBundleID: hostBundleID,
-            requestID: coldStartRequestID ?? "pending"
+            requestID: recoveryRequestID ?? coldStartRequestID ?? "pending",
+            mode: shouldShowRecoveryLink ? .recover : .speak
         )
-        coldStartHost?.view.isHidden = true
-        micButton.isHidden = false
-        micButton.isUserInteractionEnabled = true
+        coldStartHost?.view.isHidden = !shouldShowRecoveryLink
+        micButton.isHidden = shouldShowRecoveryLink
+        micButton.isUserInteractionEnabled = !shouldShowRecoveryLink
 
         guard hasFullAccess else {
             statusLabel.text = localized(
@@ -853,9 +871,11 @@ final class KeyboardViewController: UIInputViewController {
                     for: .normal
                 )
 
-            case .audioStartFailed, .bridgeUnavailable:
+            case .audioStartFailed, .bridgeUnavailable, .interrupted:
                 micButton.setTitle(
-                    localized("打开 TypeVoice 恢复", "Open TypeVoice to Recover"),
+                    hostBundleID == nil
+                        ? localized("正在准备恢复…", "Preparing recovery…")
+                        : localized("打开 TypeVoice 恢复", "Open TypeVoice to Recover"),
                     for: .normal
                 )
 
