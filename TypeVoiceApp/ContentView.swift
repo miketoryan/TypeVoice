@@ -6,6 +6,9 @@ struct ContentView: View {
     @AppStorage(SharedKeys.interfaceLanguage, store: SharedStore.defaults)
     private var languageRaw = TypeVoiceLanguage.chinese.rawValue
 
+    @AppStorage(SharedKeys.quickStandbySeconds, store: SharedStore.defaults)
+    private var quickStandbySeconds = 60
+
     private var isChinese: Bool {
         languageRaw != TypeVoiceLanguage.english.rawValue
     }
@@ -93,8 +96,8 @@ struct ContentView: View {
                     Text(text("语音服务", "Voice service"))
                 } footer: {
                     Text(text(
-                        "v0.20 ActiveSession 实验：TypeVoice 只在前台启动一次音频引擎，后台待机时只让静音输出持续运行，不挂载麦克风输入。点击键盘开始语音时，只给这个已经运行的引擎挂上输入通道；结束后立即移除输入通道，引擎本身不停。重点验证：待机时麦克风指示灯熄灭，同时第二次、第三次语音输入都不再跳转 TypeVoice。",
-                        "v0.20 ActiveSession experiment: TypeVoice starts one audio engine in the foreground. In standby only a silent output keeps that engine alive; no microphone input tap is attached. Tapping Speak attaches input to the already-running engine, and stopping removes input without stopping the engine. The test is whether the microphone indicator stays off in standby while repeated dictations avoid switching back to TypeVoice."
+                        "快速语音采用后台麦克风热启动：待命期间麦克风输入会保持开启，录音时只切换保存状态，不重新启动音频硬件。达到你设置的待命时长后会自动关闭麦克风；之后从键盘再次使用时，允许短暂跳转 TypeVoice 激活后再返回输入框。",
+                        "Quick Dictation uses a warm background microphone. During the ready window, microphone input stays open and dictation only toggles whether buffers are saved; audio hardware is not restarted. When the selected ready window expires, the microphone turns off. The next keyboard use may briefly open TypeVoice to reactivate it and return."
                     ))
                 }
 
@@ -104,11 +107,14 @@ struct ContentView: View {
                         Text("English").tag(TypeVoiceLanguage.english.rawValue)
                     }
 
-                    HStack {
-                        Text(text("后台待命", "Background readiness"))
-                        Spacer()
-                        Text(text("直到关闭快速语音", "Until Quick Dictation is disabled"))
-                            .foregroundColor(.secondary)
+                    Picker(text("后台待命时间", "Background ready window"), selection: $quickStandbySeconds) {
+                        Text(text("10 秒", "10 seconds")).tag(10)
+                        Text(text("30 秒", "30 seconds")).tag(30)
+                        Text(text("1 分钟", "1 minute")).tag(60)
+                        Text(text("5 分钟", "5 minutes")).tag(300)
+                    }
+                    .onChange(of: quickStandbySeconds) { _ in
+                        model.updateStandbyDuration()
                     }
                 } header: {
                     Text(text("使用设置", "Usage"))
@@ -185,7 +191,10 @@ struct ContentView: View {
         case .transcribing, .polishing:
             return text("完成后会自动插入当前输入框。", "The result will be inserted automatically.")
         case .ready:
-            return text("ActiveSession 已待命：输出引擎持续运行，麦克风输入当前关闭。", "ActiveSession ready: the output engine is running and microphone input is currently off.")
+            return text(
+                "麦克风已热启动，将按“后台待命时间”自动关闭。",
+                "Microphone warm standby is active and will close after the selected ready window."
+            )
         default:
             return text("开启快速语音后即可使用。", "Enable Quick Dictation to begin.")
         }
