@@ -75,23 +75,25 @@ struct ContentView: View {
                         }
                     }
 
-                    Button(
-                        model.isQuickDictationEnabled
-                            ? text("关闭快速语音", "Disable Quick Dictation")
-                            : text("开启快速语音", "Enable Quick Dictation")
-                    ) {
-                        if model.isQuickDictationEnabled {
-                            model.disarm()
-                        } else {
-                            Task { await model.arm() }
+                    Group {
+                        Button(
+                            model.isQuickDictationEnabled
+                                ? text("关闭快速语音", "Disable Quick Dictation")
+                                : text("开启快速语音", "Enable Quick Dictation")
+                        ) {
+                            if model.isQuickDictationEnabled {
+                                model.disarm()
+                            } else {
+                                Task { await model.arm() }
+                            }
                         }
-                    }
 
-                    if model.isQuickDictationEnabled && !model.isServiceReady {
-                        Button {
-                            Task { await model.arm() }
-                        } label: {
-                            Text(text("立即激活麦克风", "Activate Microphone Now"))
+                        if model.isQuickDictationEnabled && !model.isServiceReady {
+                            Button {
+                                Task { await model.arm() }
+                            } label: {
+                                Text(text("立即激活麦克风", "Activate Microphone Now"))
+                            }
                         }
                     }
                     .disabled(
