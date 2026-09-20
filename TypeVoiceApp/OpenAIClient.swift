@@ -13,6 +13,7 @@ struct ChatGPTClient {
         let boundary = "----typevoice-transcribe-\(UUID().uuidString.lowercased())"
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
+        request.timeoutInterval = 60
         applyChatGPTHeaders(to: &request)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
@@ -86,6 +87,7 @@ struct ChatGPTClient {
 
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
+        request.timeoutInterval = 60
         applyChatGPTHeaders(to: &request)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
