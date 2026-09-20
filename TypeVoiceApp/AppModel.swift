@@ -38,10 +38,13 @@ final class AppModel: ObservableObject {
     private var loginTask: Task<Void, Never>?
     private var recordingStartTask: Task<Bool, Never>?
     private var recordingStartRequestID: String?
-    private var standbyExpiryTask: Task<Void, Never>?
     private var darwinObservations: [DarwinObservation] = []
 
     init() {
+        microphoneCapture.onStandbyExpired = { [weak self] in
+            self?.expireWarmStandby()
+        }
+
         audioSessionCoordinator.onInterruptionBegan = { [weak self] in
             self?.audioInterruptionBegan()
         }
@@ -59,8 +62,6 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             Task { @MainActor in
                 let interruptedRequestID = self.activeRequestID
-                self.standbyExpiryTask?.cancel()
-                self.standbyExpiryTask = nil
                 self.microphoneCapture.shutdown()
                 self.backgroundAnchor.stop()
                 self.audioSessionCoordinator.reset()
@@ -108,7 +109,6 @@ final class AppModel: ObservableObject {
         processingTask?.cancel()
         loginTask?.cancel()
         recordingStartTask?.cancel()
-        standbyExpiryTask?.cancel()
         darwinObservations.removeAll()
         localBridge.stop()
     }
@@ -212,8 +212,6 @@ final class AppModel: ObservableObject {
             markBridgeChanged()
             DarwinBus.post(.serviceChanged)
         } catch {
-            standbyExpiryTask?.cancel()
-            standbyExpiryTask = nil
             microphoneCapture.shutdown()
             backgroundAnchor.stop()
             audioSessionCoordinator.reset()
@@ -233,8 +231,6 @@ final class AppModel: ObservableObject {
         recordingStartTask?.cancel()
         recordingStartTask = nil
         recordingStartRequestID = nil
-        standbyExpiryTask?.cancel()
-        standbyExpiryTask = nil
 
         microphoneCapture.shutdown()
         backgroundAnchor.stop()
@@ -367,38 +363,25 @@ final class AppModel: ObservableObject {
     }
 
     private func scheduleStandbyExpiry() {
-        standbyExpiryTask?.cancel()
-        standbyExpiryTask = nil
-
         guard isServiceReady,
               !microphoneCapture.isRecording else {
             return
         }
 
-        let seconds = max(10, SharedStore.quickStandbySeconds)
-        standbyExpiryTask = Task { @MainActor [weak self] in
-            do {
-                try await Task.sleep(for: .seconds(seconds))
-            } catch {
-                return
-            }
-
-            guard let self,
-                  self.isServiceReady,
-                  !self.microphoneCapture.isRecording else {
-                return
-            }
-
-            self.expireWarmStandby()
-        }
+        microphoneCapture.setStandbyExpiry(
+            after: max(10, SharedStore.quickStandbySeconds)
+        )
     }
 
     /// Releases only the warm audio resources. Ongoing transcription/result
     /// delivery is left intact, so a short standby choice never loses text.
     private func expireWarmStandby() {
-        standbyExpiryTask?.cancel()
-        standbyExpiryTask = nil
+        guard isServiceReady,
+              !microphoneCapture.isRecording else {
+            return
+        }
 
+        microphoneCapture.clearStandbyExpiry()
         microphoneCapture.shutdown(removeRecording: false)
         backgroundAnchor.stop()
         audioSessionCoordinator.reset()
@@ -589,8 +572,7 @@ final class AppModel: ObservableObject {
                 throw MicrophoneCaptureError.warmStandbyUnavailable
             }
 
-            standbyExpiryTask?.cancel()
-            standbyExpiryTask = nil
+            microphoneCapture.clearStandbyExpiry()
 
             try await audioSessionCoordinator.beginAndWait(.capture)
             bridgeAudioStage = .captureSessionReady
@@ -765,8 +747,7 @@ final class AppModel: ObservableObject {
         recordingStartTask?.cancel()
         recordingStartTask = nil
         recordingStartRequestID = nil
-        standbyExpiryTask?.cancel()
-        standbyExpiryTask = nil
+        microphoneCapture.clearStandbyExpiry()
 
         // Once iOS tears down microphone IO we deliberately do not restart it
         // from the background. Mark the warm service cold; the next keyboard
