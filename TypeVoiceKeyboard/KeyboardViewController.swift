@@ -150,9 +150,7 @@ final class KeyboardViewController: UIInputViewController {
                 }
 
             case .authRequired:
-                if let requestID = latestState.requestID ?? currentRequestID {
-                    launchForegroundRecovery(requestID: requestID)
-                }
+                openTypeVoiceForAccountRecovery()
 
             default:
                 startRecordingRequest()
@@ -443,6 +441,8 @@ final class KeyboardViewController: UIInputViewController {
         commandTask?.cancel()
         startFallbackTask?.cancel()
 
+        startClaimFallbackWindow(requestID: requestID)
+
         commandTask = Task { @MainActor [weak self] in
             guard let self else { return }
 
@@ -453,18 +453,10 @@ final class KeyboardViewController: UIInputViewController {
                     timeoutInterval: 1.0
                 )
                 self.apply(state)
-
-                if state.requestID == requestID,
-                   state.requestClaimed {
-                    return
-                }
             } catch {
-                // Do not foreground immediately. The containing app may have
-                // received and claimed the request even if this HTTP response
-                // was lost or delayed.
+                // The independent 1.5 s claim window is already running.
+                // A lost HTTP response must not cause an immediate app switch.
             }
-
-            self.startClaimFallbackWindow(requestID: requestID)
         }
     }
 
@@ -848,6 +840,34 @@ final class KeyboardViewController: UIInputViewController {
                 "Could not identify the original app. Tap the microphone again."
             )
             self.resolveHostApplicationWithRetries()
+        }
+    }
+
+    private func openTypeVoiceForAccountRecovery() {
+        var components = URLComponents()
+        components.scheme = "typevoice"
+        components.host = "prepare"
+        components.queryItems = [
+            URLQueryItem(name: "source", value: "auth")
+        ]
+
+        guard let url = components.url else { return }
+
+        statusLabel.text = localized(
+            "正在打开 TypeVoice 重新登录…",
+            "Opening TypeVoice to sign in again…"
+        )
+        recoveryURLLauncher.open(url)
+
+        Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(600))
+            } catch {
+                return
+            }
+
+            guard let self, self.keyboardVisible else { return }
+            self.extensionContext?.open(url, completionHandler: nil)
         }
     }
 
