@@ -39,6 +39,7 @@ final class AppModel: ObservableObject {
     private var loginTask: Task<Void, Never>?
     private var recordingStartTask: Task<Bool, Never>?
     private var recordingStartRequestID: String?
+    private var foregroundWarmupTask: Task<Bool, Never>?
     private var keyboardIsVisible = false
     private var keyboardHasBeenSeen = false
     private var activationHandoffInProgress = false
@@ -113,6 +114,7 @@ final class AppModel: ObservableObject {
         processingTask?.cancel()
         loginTask?.cancel()
         recordingStartTask?.cancel()
+        foregroundWarmupTask?.cancel()
         darwinObservations.removeAll()
         localBridge.stop()
     }
@@ -235,6 +237,8 @@ final class AppModel: ObservableObject {
         recordingStartTask?.cancel()
         recordingStartTask = nil
         recordingStartRequestID = nil
+        foregroundWarmupTask?.cancel()
+        foregroundWarmupTask = nil
 
         microphoneCapture.shutdown()
         backgroundAnchor.stop()
@@ -263,9 +267,15 @@ final class AppModel: ObservableObject {
             .first(where: { $0.name == "autostart" })?.value == "1"
         let cameFromKeyboard = source == "keyboard"
 
+        if cameFromKeyboard {
+            activationHandoffInProgress = true
+        }
+
         Task {
-            if cameFromKeyboard {
-                activationHandoffInProgress = true
+            defer {
+                if cameFromKeyboard {
+                    activationHandoffInProgress = false
+                }
             }
 
             let audioReady: Bool
@@ -278,7 +288,7 @@ final class AppModel: ObservableObject {
                 // to UIApplication.State.active. Wait for the foreground state,
                 // then retry the microphone graph a few times if CoreAudio is
                 // still settling from the app switch.
-                audioReady = await prepareForegroundWarmSession(
+                audioReady = await ensureForegroundWarmSession(
                     requestID: requestedRecordingID
                 )
             } else {
@@ -317,11 +327,39 @@ final class AppModel: ObservableObject {
                 _ = PreviousAppReturner.open(bundleID: requestedHostBundleID)
             }
 
-            activationHandoffInProgress = false
         }
     }
 
-    private func prepareForegroundWarmSession(
+    private func ensureForegroundWarmSession(
+        requestID: String?
+    ) async -> Bool {
+        if backgroundWakeReady {
+            microphoneCapture.clearStandbyExpiry()
+            return true
+        }
+
+        if let foregroundWarmupTask {
+            return await foregroundWarmupTask.value
+        }
+
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return false }
+            return await self.performForegroundWarmSession(
+                requestID: requestID
+            )
+        }
+
+        foregroundWarmupTask = task
+        let result = await task.value
+
+        if foregroundWarmupTask != nil {
+            foregroundWarmupTask = nil
+        }
+
+        return result
+    }
+
+    private func performForegroundWarmSession(
         requestID: String?
     ) async -> Bool {
         guard authManager.isLoggedIn else {
@@ -364,26 +402,34 @@ final class AppModel: ObservableObject {
 
         var finalError: Error?
 
+        // Give the outgoing host app/audio route one short moment to finish its
+        // foreground -> background transition before forcing our audio session.
+        try? await Task.sleep(for: .milliseconds(140))
+
         for attempt in 0..<3 {
+            guard !Task.isCancelled else { return false }
+
             microphoneCapture.shutdown()
             backgroundAnchor.stop()
 
-            if attempt > 0 {
-                audioSessionCoordinator.reset()
-                try? await Task.sleep(for: .milliseconds(140))
-            }
-
             do {
-                try await audioSessionCoordinator.beginAndWait(.backgroundKeepAlive)
+                // Do not trust the cached sessionIsActive value after a long
+                // background interval. Force setActive(true) every recovery
+                // attempt, but do NOT deactivate between attempts; repeatedly
+                // toggling setActive(false/true) creates its own race with music
+                // and the outgoing host app.
+                try await audioSessionCoordinator.beginAndReassert(
+                    .backgroundKeepAlive
+                )
 
-                // A short foreground settle delay substantially reduces the
-                // kAUStartIO/no-buffer race immediately after an app switch.
-                if attempt == 0 {
-                    try? await Task.sleep(for: .milliseconds(90))
+                if attempt > 0 {
+                    try? await Task.sleep(
+                        for: .milliseconds(120 + attempt * 80)
+                    )
                 }
 
                 try await microphoneCapture.warmUp(
-                    firstBufferTimeout: .milliseconds(1_300)
+                    firstBufferTimeout: .milliseconds(1_600)
                 )
                 try backgroundAnchor.start()
 
@@ -405,7 +451,9 @@ final class AppModel: ObservableObject {
                 isServiceReady = false
 
                 if attempt < 2 {
-                    try? await Task.sleep(for: .milliseconds(160))
+                    try? await Task.sleep(
+                        for: .milliseconds(180 + attempt * 100)
+                    )
                 }
             }
         }
@@ -449,20 +497,21 @@ final class AppModel: ObservableObject {
     func appBecameActive() {
         refreshAuthState()
 
-        guard isServiceReady, !backgroundWakeReady else { return }
+        // A keyboard URL activation owns the foreground recovery flow. Do not
+        // start a second warmUp from the scene lifecycle callback.
+        guard !activationHandoffInProgress,
+              isServiceReady,
+              !backgroundWakeReady else {
+            return
+        }
 
         Task {
-            do {
-                try await audioSessionCoordinator.reassertCurrentProfile()
-                try await microphoneCapture.warmUp()
-                try backgroundAnchor.start()
-                microphoneCapture.clearStandbyExpiry()
-                bridgeAudioStage = .standbySessionReady
-                lastError = nil
-                markBridgeChanged()
-            } catch {
+            let recovered = await ensureForegroundWarmSession(
+                requestID: activeRequestID
+            )
+
+            if !recovered {
                 bridgeAudioStage = .failed
-                lastError = error.localizedDescription
                 markBridgeChanged()
             }
         }
