@@ -93,8 +93,8 @@ struct ContentView: View {
                     Text(text("语音服务", "Voice service"))
                 } footer: {
                     Text(text(
-                        "实验版：开启快速语音时，TypeVoice 会在前台建立并验证输入音频引擎，然后立即暂停。后台待机依靠静音播放保持运行；点击键盘后只恢复同一个已准备好的引擎，不重新建图。重点验证待机时麦克风指示灯能否熄灭、同时又避免跳转。",
-                        "Experimental build: TypeVoice builds and validates the input engine in the foreground, then immediately pauses it. Silent playback keeps the app alive in standby; tapping Speak resumes the same prepared engine instead of rebuilding it. This tests whether the microphone indicator can turn off in standby while app switching is still avoided."
+                        "v0.20 ActiveSession 实验：TypeVoice 只在前台启动一次音频引擎，后台待机时只让静音输出持续运行，不挂载麦克风输入。点击键盘开始语音时，只给这个已经运行的引擎挂上输入通道；结束后立即移除输入通道，引擎本身不停。重点验证：待机时麦克风指示灯熄灭，同时第二次、第三次语音输入都不再跳转 TypeVoice。",
+                        "v0.20 ActiveSession experiment: TypeVoice starts one audio engine in the foreground. In standby only a silent output keeps that engine alive; no microphone input tap is attached. Tapping Speak attaches input to the already-running engine, and stopping removes input without stopping the engine. The test is whether the microphone indicator stays off in standby while repeated dictations avoid switching back to TypeVoice."
                     ))
                 }
 
@@ -185,7 +185,7 @@ struct ContentView: View {
         case .transcribing, .polishing:
             return text("完成后会自动插入当前输入框。", "The result will be inserted automatically.")
         case .ready:
-            return text("后台已进入 prepared + paused 待机；键盘点击会恢复同一个已准备好的引擎。", "Prepared + paused standby is ready; the keyboard resumes the same prepared engine.")
+            return text("ActiveSession 已待命：输出引擎持续运行，麦克风输入当前关闭。", "ActiveSession ready: the output engine is running and microphone input is currently off.")
         default:
             return text("开启快速语音后即可使用。", "Enable Quick Dictation to begin.")
         }
