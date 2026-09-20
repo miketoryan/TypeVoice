@@ -6,31 +6,40 @@ final class MicrophoneCapture {
     private let lock = NSLock()
 
     private var engine: AVAudioEngine?
+    private var keepAlivePlayer: AVAudioPlayerNode?
+    private var keepAliveBuffer: AVAudioPCMBuffer?
+
     private var recordingFile: AVAudioFile?
     private var recordingURL: URL?
     private var tapInstalled = false
-    private var receivedAnyPreparedBuffer = false
     private var receivedRecordingBuffer = false
 
-    /// True only while samples are actively being written to a dictation file.
+    /// True only while microphone samples are actively being written.
     var isActive: Bool {
-        isRecording && engine?.isRunning == true
+        isRecording && engine?.isRunning == true && tapInstalled
     }
 
-    /// The exact input graph and tap already exist and have previously delivered
-    /// real audio. In standby the engine is PAUSED, not stopped/reset/destroyed.
-    var isPreparedForResume: Bool {
-        engine != nil && tapInstalled && receivedAnyPreparedBuffer
+    /// v0.20 standby invariant:
+    /// - one AVAudioEngine is already running;
+    /// - only a silent OUTPUT node is rendering;
+    /// - no input tap exists, so the microphone path is idle.
+    ///
+    /// Keyboard dictation is allowed only from this state. Starting a dictation
+    /// must never call AVAudioEngine.start() from the background.
+    var isStandbyReady: Bool {
+        engine?.isRunning == true
+            && keepAlivePlayer?.isPlaying == true
+            && !tapInstalled
+            && !isRecording
     }
 
     var isEngineRunning: Bool {
         engine?.isRunning == true
     }
 
-    /// Compatibility name used by AppModel. "Warm" now means prepared+paused
-    /// standby is available; it no longer means the microphone engine is running.
+    /// Compatibility name used by the bridge/UI.
     var isWarmReady: Bool {
-        isPreparedForResume
+        isStandbyReady || isActive
     }
 
     var isRecording: Bool {
@@ -51,94 +60,100 @@ final class MicrophoneCapture {
         }
     }
 
-    /// Builds and validates the graph while TypeVoice is foregrounded, then
-    /// pauses it. The graph/tap stay prepared while active audio processing stops.
-    func preparePausedStandby(
-        firstBufferTimeout: Duration = .milliseconds(900)
-    ) async throws {
-        if isPreparedForResume {
-            try await validateAndPausePreparedEngine(
-                firstBufferTimeout: firstBufferTimeout
-            )
+    /// Creates one engine while TypeVoice is foregrounded and keeps that engine
+    /// running with a looping silent OUTPUT buffer. The input node is deliberately
+    /// untouched here. This keeps background audio execution alive without
+    /// continuously rendering microphone input.
+    func armActiveSession() throws {
+        if isStandbyReady {
             return
+        }
+
+        guard !isRecording else {
+            throw MicrophoneCaptureError.alreadyRecording
         }
 
         shutdown(removeRecording: true)
 
         let newEngine = AVAudioEngine()
-        let input = newEngine.inputNode
-        let format = input.outputFormat(forBus: 0)
+        let player = AVAudioPlayerNode()
 
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            throw MicrophoneCaptureError.inputUnavailable
+        guard let outputFormat = AVAudioFormat(
+            standardFormatWithSampleRate: 8_000,
+            channels: 1
+        ) else {
+            throw MicrophoneCaptureError.outputAnchorUnavailable
         }
 
-        lock.lock()
-        receivedAnyPreparedBuffer = false
-        receivedRecordingBuffer = false
-        lock.unlock()
-
-        input.installTap(
-            onBus: 0,
-            bufferSize: 1_024,
-            format: nil
-        ) { [weak self] buffer, _ in
-            self?.consume(buffer)
+        let frameCapacity: AVAudioFrameCount = 8_000
+        guard let silentBuffer = AVAudioPCMBuffer(
+            pcmFormat: outputFormat,
+            frameCapacity: frameCapacity
+        ) else {
+            throw MicrophoneCaptureError.outputAnchorUnavailable
         }
-        tapInstalled = true
 
+        silentBuffer.frameLength = frameCapacity
+        if let channelData = silentBuffer.floatChannelData {
+            channelData[0].initialize(
+                repeating: 0,
+                count: Int(frameCapacity)
+            )
+        }
+
+        newEngine.attach(player)
+        newEngine.connect(
+            player,
+            to: newEngine.mainMixerNode,
+            format: outputFormat
+        )
         newEngine.prepare()
-        engine = newEngine
 
         do {
             try newEngine.start()
-            try await waitForPreparedBuffer(timeout: firstBufferTimeout)
-            newEngine.pause()
         } catch {
-            shutdown(removeRecording: true)
+            newEngine.disconnectNodeOutput(player)
+            newEngine.detach(player)
             throw error
         }
+
+        player.scheduleBuffer(
+            silentBuffer,
+            at: nil,
+            options: .loops
+        )
+        player.play()
+
+        guard newEngine.isRunning, player.isPlaying else {
+            player.stop()
+            newEngine.stop()
+            newEngine.disconnectNodeOutput(player)
+            newEngine.detach(player)
+            throw MicrophoneCaptureError.outputAnchorUnavailable
+        }
+
+        engine = newEngine
+        keepAlivePlayer = player
+        keepAliveBuffer = silentBuffer
+        tapInstalled = false
     }
 
-    /// Foreground recovery for an existing prepared graph. It proves that the
-    /// same graph can still start, sees a real buffer, then returns to pause.
-    private func validateAndPausePreparedEngine(
-        firstBufferTimeout: Duration
-    ) async throws {
-        guard let engine, tapInstalled else {
-            throw MicrophoneCaptureError.warmStandbyUnavailable
-        }
-
-        if engine.isRunning {
-            engine.pause()
-        }
-
-        lock.lock()
-        receivedAnyPreparedBuffer = false
-        lock.unlock()
-
-        do {
-            try engine.start()
-            try await waitForPreparedBuffer(timeout: firstBufferTimeout)
-            engine.pause()
-        } catch {
-            throw error
-        }
-    }
-
-    /// Resumes the SAME prepared engine from its paused state and opens the file
-    /// gate. This is the only background engine.start() in the experiment.
+    /// Starts microphone capture without starting/restarting the engine.
+    ///
+    /// The engine was already started in the foreground by armActiveSession().
+    /// A keyboard request only attaches the input tap to that running graph and
+    /// waits for the first real microphone buffer.
     func startRecording(
-        firstBufferTimeout: Duration = .milliseconds(650)
+        firstBufferTimeout: Duration = .milliseconds(800)
     ) async throws -> URL {
         guard !isRecording else {
             throw MicrophoneCaptureError.alreadyRecording
         }
 
-        guard isPreparedForResume,
+        guard isStandbyReady,
               let engine,
-              tapInstalled else {
-            throw MicrophoneCaptureError.warmStandbyUnavailable
+              engine.isRunning else {
+            throw MicrophoneCaptureError.activeStandbyUnavailable
         }
 
         let input = engine.inputNode
@@ -166,24 +181,28 @@ final class MicrophoneCapture {
         lock.unlock()
 
         do {
-            if !engine.isRunning {
-                try engine.start()
+            input.installTap(
+                onBus: 0,
+                bufferSize: 1_024,
+                format: nil
+            ) { [weak self] buffer, _ in
+                self?.consume(buffer)
             }
+            tapInstalled = true
 
+            // Deliberately NO engine.start() here.
             try await waitForRecordingBuffer(timeout: firstBufferTimeout)
             return url
         } catch {
-            discardRecording()
-            if engine.isRunning {
-                engine.pause()
-            }
+            closeInputTap()
+            discardRecordingFile()
             throw error
         }
     }
 
-    /// Closes the recording gate and pauses the engine without destroying the
-    /// graph. The next dictation resumes this same prepared engine.
-    func finishRecordingAndPause() -> URL? {
+    /// Closes the microphone path but keeps the same output-only engine running.
+    /// This is the normal return to standby after every dictation.
+    func finishRecordingToStandby() -> URL? {
         lock.lock()
         let url = recordingURL
         recordingFile = nil
@@ -191,15 +210,12 @@ final class MicrophoneCapture {
         receivedRecordingBuffer = false
         lock.unlock()
 
-        if engine?.isRunning == true {
-            engine?.pause()
-        }
-
+        closeInputTap()
         return url
     }
 
-    /// Discards current recording and returns the existing graph to paused standby.
-    func discardRecordingAndPause() {
+    /// Cancels the current dictation and returns to output-only standby.
+    func discardRecordingToStandby() {
         lock.lock()
         let url = recordingURL
         recordingFile = nil
@@ -207,69 +223,46 @@ final class MicrophoneCapture {
         receivedRecordingBuffer = false
         lock.unlock()
 
-        if engine?.isRunning == true {
-            engine?.pause()
-        }
+        closeInputTap()
 
         if let url {
             try? FileManager.default.removeItem(at: url)
         }
     }
 
-    /// Removes only the file gate; used after a failed resume while the graph
-    /// itself may still be reusable for foreground recovery.
-    func discardRecording() {
-        lock.lock()
-        let url = recordingURL
-        recordingFile = nil
-        recordingURL = nil
-        receivedRecordingBuffer = false
-        lock.unlock()
-
-        if let url {
-            try? FileManager.default.removeItem(at: url)
-        }
-    }
-
-    /// Fully releases the prepared graph. Used when Quick Dictation is disabled
-    /// or iOS invalidates the audio stack.
+    /// Fully releases the audio graph. Used when Quick Dictation is disabled,
+    /// when iOS interrupts/resets audio, or before a foreground rebuild.
     func shutdown(removeRecording: Bool = true) {
         lock.lock()
         let url = recordingURL
         recordingFile = nil
         recordingURL = nil
-        receivedAnyPreparedBuffer = false
         receivedRecordingBuffer = false
         lock.unlock()
+
+        closeInputTap()
+
+        keepAlivePlayer?.stop()
 
         if let engine {
             if engine.isRunning {
                 engine.stop()
             }
 
-            if tapInstalled {
-                engine.inputNode.removeTap(onBus: 0)
+            if let keepAlivePlayer {
+                engine.disconnectNodeOutput(keepAlivePlayer)
+                engine.detach(keepAlivePlayer)
             }
 
             engine.reset()
         }
 
-        tapInstalled = false
+        keepAlivePlayer = nil
+        keepAliveBuffer = nil
         self.engine = nil
 
         if removeRecording, let url {
             try? FileManager.default.removeItem(at: url)
-        }
-    }
-
-    private func waitForPreparedBuffer(timeout: Duration) async throws {
-        let startedAt = ContinuousClock.now
-
-        while !hasReceivedAnyPreparedBuffer {
-            if ContinuousClock.now - startedAt >= timeout {
-                throw MicrophoneCaptureError.noAudioFlow
-            }
-            try await Task.sleep(for: .milliseconds(20))
         }
     }
 
@@ -284,21 +277,36 @@ final class MicrophoneCapture {
         }
     }
 
-    private var hasReceivedAnyPreparedBuffer: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return receivedAnyPreparedBuffer
-    }
-
     private var hasReceivedRecordingBuffer: Bool {
         lock.lock()
         defer { lock.unlock() }
         return receivedRecordingBuffer
     }
 
+    private func closeInputTap() {
+        guard tapInstalled else { return }
+
+        if let engine {
+            engine.inputNode.removeTap(onBus: 0)
+        }
+        tapInstalled = false
+    }
+
+    private func discardRecordingFile() {
+        lock.lock()
+        let url = recordingURL
+        recordingFile = nil
+        recordingURL = nil
+        receivedRecordingBuffer = false
+        lock.unlock()
+
+        if let url {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
     private func consume(_ buffer: AVAudioPCMBuffer) {
         lock.lock()
-        receivedAnyPreparedBuffer = true
         let file = recordingFile
 
         if let file {
@@ -312,7 +320,8 @@ final class MicrophoneCapture {
 enum MicrophoneCaptureError: LocalizedError {
     case alreadyRecording
     case inputUnavailable
-    case warmStandbyUnavailable
+    case activeStandbyUnavailable
+    case outputAnchorUnavailable
     case noAudioFlow
 
     var errorDescription: String? {
@@ -321,10 +330,12 @@ enum MicrophoneCaptureError: LocalizedError {
             return "A recording is already in progress."
         case .inputUnavailable:
             return "The microphone input is unavailable."
-        case .warmStandbyUnavailable:
-            return "The prepared microphone engine is no longer available. Open TypeVoice to restore it."
+        case .activeStandbyUnavailable:
+            return "The active standby audio engine is no longer available. Open TypeVoice to restore it."
+        case .outputAnchorUnavailable:
+            return "TypeVoice could not start the output-only background audio anchor."
         case .noAudioFlow:
-            return "The microphone engine started but no audio arrived."
+            return "The microphone path opened but no audio arrived."
         }
     }
 }
