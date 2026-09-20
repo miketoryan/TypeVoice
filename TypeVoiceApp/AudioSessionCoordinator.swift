@@ -175,7 +175,10 @@ final class AudioSessionCoordinator {
         }
 
         try await performSessionMutation {
-            if needsReconfiguration || force {
+            // Even a forced recovery does not rewrite the category unless iOS
+            // actually changed it. This keeps interruption recovery from
+            // reintroducing background category mutations.
+            if needsReconfiguration {
                 try session.setCategory(
                     target.category,
                     mode: target.mode,
