@@ -444,6 +444,7 @@ final class KeyboardViewController: UIInputViewController {
             serverID: latestState.serverID,
             revision: latestState.revision &+ 1,
             serviceReady: true,
+            quickDictationEnabled: latestState.quickDictationEnabled,
             backgroundWakeReady: latestState.backgroundWakeReady,
             microphoneReady: latestState.microphoneReady,
             requestClaimed: false,
@@ -558,10 +559,22 @@ final class KeyboardViewController: UIInputViewController {
             !latestState.serviceReady
             || !latestState.backgroundWakeReady
 
+        let quickDictationDisabled =
+            latestState.quickDictationEnabled == false
+
         let shouldShowForegroundLink =
             hostBundleID != nil
             && launchRequestID != nil
-            && (isColdState || hasRecoverableAudioError)
+            && (quickDictationDisabled || isColdState || hasRecoverableAudioError)
+
+        let foregroundLinkMode: ColdStartMicLink.Mode
+        if quickDictationDisabled {
+            foregroundLinkMode = .enable
+        } else if hasRecoverableAudioError {
+            foregroundLinkMode = .recover
+        } else {
+            foregroundLinkMode = .speak
+        }
 
         // If the warm microphone is no longer available, use a real user-tapped
         // SwiftUI Link immediately. We no longer spend 1.5 seconds attempting a
@@ -571,7 +584,7 @@ final class KeyboardViewController: UIInputViewController {
             isEnglish: latestState.interfaceLanguage == "en",
             hostBundleID: hostBundleID,
             requestID: launchRequestID ?? "pending",
-            mode: hasRecoverableAudioError ? .recover : .speak,
+            mode: foregroundLinkMode,
             onActivate: { [weak self] in
                 self?.beginForegroundHandoff()
             }
@@ -611,15 +624,20 @@ final class KeyboardViewController: UIInputViewController {
 
         switch latestState.status {
         case .idle:
-            if latestState.serviceReady && bridgeLeaseIsFresh {
+            if latestState.quickDictationEnabled == false {
+                statusLabel.text = localized(
+                    "快速语音未开启 · 点击打开 TypeVoice 设置",
+                    "Quick Dictation is off · tap to open TypeVoice"
+                )
+            } else if latestState.serviceReady && bridgeLeaseIsFresh {
                 statusLabel.text = latestState.backgroundWakeReady
                     ? localized(
                         "麦克风热待命 · 可直接语音",
                         "Microphone warm · ready to dictate"
                     )
                     : localized(
-                        "TypeVoice 在线 · 麦克风需要重新激活",
-                        "TypeVoice is online · microphone needs reactivation"
+                        "快速语音已开启 · 麦克风冷待命",
+                        "Quick Dictation is on · microphone is cold"
                     )
             } else {
                 statusLabel.text = localized(
@@ -813,6 +831,7 @@ final class KeyboardViewController: UIInputViewController {
                     serverID: self.latestState.serverID,
                     revision: self.latestState.revision &+ 1,
                     serviceReady: self.latestState.serviceReady,
+                    quickDictationEnabled: self.latestState.quickDictationEnabled,
                     backgroundWakeReady: self.latestState.backgroundWakeReady,
                     microphoneReady: self.latestState.microphoneReady,
                     requestClaimed: false,
