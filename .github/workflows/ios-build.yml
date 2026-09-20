@@ -7,6 +7,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: macos-15
@@ -20,6 +23,9 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate
 
+      - name: Show Xcode version
+        run: xcodebuild -version
+
       - name: Build for iOS Simulator
         run: |
           set -o pipefail
@@ -31,33 +37,69 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build
 
-      - name: Build unsigned device app
+      - name: Archive unsigned iPhone app
         run: |
           set -o pipefail
-          rm -rf build/DerivedData build/Payload build/TypeVoice-unsigned.ipa
+          rm -rf "$RUNNER_TEMP/TypeVoice.xcarchive"
           xcodebuild \
             -project TypeVoice.xcodeproj \
             -scheme TypeVoice \
             -configuration Release \
-            -sdk iphoneos \
             -destination 'generic/platform=iOS' \
-            -derivedDataPath build/DerivedData \
+            -archivePath "$RUNNER_TEMP/TypeVoice.xcarchive" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            build
+            archive
 
-          APP_PATH="$(find build/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -name 'TypeVoice.app' -print -quit)"
-          test -n "$APP_PATH"
-          mkdir -p build/Payload
-          cp -R "$APP_PATH" build/Payload/TypeVoice.app
-          (
-            cd build
-            /usr/bin/zip -qry TypeVoice-unsigned.ipa Payload
-          )
+      - name: Validate packaged app metadata
+        run: |
+          APP_PATH="$RUNNER_TEMP/TypeVoice.xcarchive/Products/Applications/TypeVoice.app"
+          APP_PLIST="$APP_PATH/Info.plist"
+          KEYBOARD_PATH="$APP_PATH/PlugIns/TypeVoiceKeyboard.appex"
+          KEYBOARD_PLIST="$KEYBOARD_PATH/Info.plist"
+
+          test -d "$APP_PATH"
+          test -d "$KEYBOARD_PATH"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PLIST")" = "com.miketoryan.TypeVoice"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$APP_PLIST")" != ""
+          test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionPointIdentifier' "$KEYBOARD_PLIST")" = "com.apple.keyboard-service"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionAttributes:RequestsOpenAccess' "$KEYBOARD_PLIST")" = "true"
+
+      - name: Add ad-hoc signature skeleton for AltServer
+        run: |
+          APP_PATH="$RUNNER_TEMP/TypeVoice.xcarchive/Products/Applications/TypeVoice.app"
+          KEYBOARD_PATH="$APP_PATH/PlugIns/TypeVoiceKeyboard.appex"
+
+          # Sign nested code first, then the containing app. AltServer/AltStore
+          # will replace these ad-hoc signatures with the user's provisioning
+          # profiles during sideloading.
+          codesign --force --sign - --timestamp=none "$KEYBOARD_PATH"
+          codesign --force --sign - --timestamp=none "$APP_PATH"
+
+          codesign --verify --strict "$KEYBOARD_PATH"
+          codesign --verify --strict "$APP_PATH"
+
+      - name: Package IPA for AltServer
+        run: |
+          APP_PATH="$RUNNER_TEMP/TypeVoice.xcarchive/Products/Applications/TypeVoice.app"
+          PACKAGE_ROOT="$RUNNER_TEMP/typevoice-ipa"
+
+          rm -rf "$PACKAGE_ROOT"
+          mkdir -p "$PACKAGE_ROOT/Payload"
+          ditto "$APP_PATH" "$PACKAGE_ROOT/Payload/TypeVoice.app"
+
+          cd "$PACKAGE_ROOT"
+          ditto -c -k --sequesterRsrc --keepParent Payload TypeVoice-v0.20-AltServer.ipa
+
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          mv TypeVoice-v0.20-AltServer.ipa "$GITHUB_WORKSPACE/artifacts/TypeVoice-v0.20-AltServer.ipa"
+
+          /usr/bin/unzip -t "$GITHUB_WORKSPACE/artifacts/TypeVoice-v0.20-AltServer.ipa"
 
       - name: Upload AltServer IPA
         uses: actions/upload-artifact@v4
         with:
-          name: TypeVoice-AltServer-IPA
-          path: build/TypeVoice-unsigned.ipa
+          name: TypeVoice-v0.20-AltServer
+          path: artifacts/TypeVoice-v0.20-AltServer.ipa
+          retention-days: 7
           if-no-files-found: error
