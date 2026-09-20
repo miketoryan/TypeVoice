@@ -58,9 +58,4 @@ enum SharedStore {
             defaults.set(newValue, forKey: SharedKeys.cleanupModel)
         }
     }
-
-    // Compatibility hooks used by AudioStandbyService. Readiness is now
-    // authoritative in AppModel/LocalBridge, not UserDefaults.
-    static func touchServiceHeartbeat(_ date: Date = Date()) {}
-    static func clearServiceReady() {}
 }
