@@ -40,6 +40,7 @@ final class AppModel: ObservableObject {
     private var recordingStartRequestID: String?
     private var keyboardIsVisible = false
     private var keyboardHasBeenSeen = false
+    private var activationHandoffInProgress = false
     private var darwinObservations: [DarwinObservation] = []
 
     init() {
@@ -445,6 +446,7 @@ final class AppModel: ObservableObject {
             .heartbeat,
             .keyboardVisible,
             .keyboardHidden,
+            .activationHandoffBegan,
             .startRecording,
             .stopRecording,
             .cancelRecording,
@@ -476,9 +478,18 @@ final class AppModel: ObservableObject {
         }
 
         switch event {
+        case .activationHandoffBegan:
+            // Opening TypeVoice from the keyboard temporarily makes the keyboard
+            // disappear. That is NOT a user exit and must not start the standby
+            // countdown or disturb the foreground activation/return sequence.
+            activationHandoffInProgress = true
+            keyboardIsVisible = false
+            microphoneCapture.clearStandbyExpiry()
+
         case .keyboardVisible, .heartbeat:
             keyboardIsVisible = true
             keyboardHasBeenSeen = true
+            activationHandoffInProgress = false
             refreshVisibleKeyboardLease()
 
             if event == .heartbeat {
@@ -488,7 +499,12 @@ final class AppModel: ObservableObject {
         case .keyboardHidden:
             keyboardIsVisible = false
             keyboardHasBeenSeen = true
-            scheduleStandbyExpiry()
+
+            if activationHandoffInProgress {
+                microphoneCapture.clearStandbyExpiry()
+            } else {
+                scheduleStandbyExpiry()
+            }
             DarwinBus.post(.serviceChanged)
 
         default:
