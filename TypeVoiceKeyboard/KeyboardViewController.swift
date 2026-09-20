@@ -266,7 +266,10 @@ final class KeyboardViewController: UIInputViewController {
                 isEnglish: latestState.interfaceLanguage == "en",
                 hostBundleID: hostBundleID,
                 requestID: coldStartRequestID ?? UUID().uuidString,
-                mode: .speak
+                mode: .speak,
+                onActivate: {
+                    DarwinBus.post(.activationHandoffBegan)
+                }
             )
         )
         coldHost.view.translatesAutoresizingMaskIntoConstraints = false
@@ -733,29 +736,44 @@ final class KeyboardViewController: UIInputViewController {
             coldStartRequestID = UUID().uuidString
         }
 
-        let recoveryRequestID = latestState.requestID ?? currentRequestID
-        let shouldShowRecoveryLink =
+        let launchRequestID =
+            latestState.requestID
+            ?? currentRequestID
+            ?? coldStartRequestID
+
+        let hasRecoverableAudioError =
             latestState.status == .error
             && (
                 latestState.failureKind == .audioStartFailed
                 || latestState.failureKind == .bridgeUnavailable
                 || latestState.failureKind == .interrupted
             )
-            && hostBundleID != nil
-            && recoveryRequestID != nil
 
-        // Normal dictation always gets the warm no-switch attempt first.
-        // After a warm audio failure, the center control becomes a *real*
-        // user-tapped SwiftUI Link. No hidden openURL or 600 ms retry is involved.
+        let isColdState =
+            !latestState.serviceReady
+            || !latestState.backgroundWakeReady
+
+        let shouldShowForegroundLink =
+            hostBundleID != nil
+            && launchRequestID != nil
+            && (isColdState || hasRecoverableAudioError)
+
+        // If the warm microphone is no longer available, use a real user-tapped
+        // SwiftUI Link immediately. We no longer spend 1.5 seconds attempting a
+        // background start that iOS cannot complete after the warm input closed.
+        // Warm-ready dictation still uses the normal no-switch button.
         coldStartHost?.rootView = ColdStartMicLink(
             isEnglish: latestState.interfaceLanguage == "en",
             hostBundleID: hostBundleID,
-            requestID: recoveryRequestID ?? coldStartRequestID ?? "pending",
-            mode: shouldShowRecoveryLink ? .recover : .speak
+            requestID: launchRequestID ?? "pending",
+            mode: hasRecoverableAudioError ? .recover : .speak,
+            onActivate: {
+                DarwinBus.post(.activationHandoffBegan)
+            }
         )
-        coldStartHost?.view.isHidden = !shouldShowRecoveryLink
-        micButton.isHidden = shouldShowRecoveryLink
-        micButton.isUserInteractionEnabled = !shouldShowRecoveryLink
+        coldStartHost?.view.isHidden = !shouldShowForegroundLink
+        micButton.isHidden = shouldShowForegroundLink
+        micButton.isUserInteractionEnabled = !shouldShowForegroundLink
 
         guard hasFullAccess else {
             statusLabel.text = localized(
@@ -995,6 +1013,11 @@ final class KeyboardViewController: UIInputViewController {
             "后台恢复失败，正在打开 TypeVoice 激活麦克风…",
             "Background recovery failed. Opening TypeVoice to activate the microphone…"
         )
+
+        // Mark this disappearance as a temporary activation handoff before the
+        // keyboard leaves the screen. AppModel will ignore the corresponding
+        // keyboardHidden event for standby timing.
+        DarwinBus.post(.activationHandoffBegan)
 
         // Prefer the same SwiftUI openURL handoff pattern already proven in
         // VoiceKing. This is only a recovery fallback; the normal TypeVoice
