@@ -2,8 +2,7 @@ import Foundation
 
 enum LocalBridge {
     static let port = 14_558
-    static let protocolVersion = "6"
-    static let keyboardHeartbeatInterval: Duration = .seconds(2)
+    static let protocolVersion = "7"
     static let resultValidity: TimeInterval = 300
 
     static let commandURL = URL(string: "http://127.0.0.1:\(port)/command")!
@@ -12,7 +11,6 @@ enum LocalBridge {
 
 enum BridgeAction: String, Codable, Sendable {
     case state
-    case heartbeat
     case startRecording
     case stopRecording
     case cancelRecording
