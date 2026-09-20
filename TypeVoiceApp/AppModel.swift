@@ -25,6 +25,7 @@ final class AppModel: ObservableObject {
     private var bridgeRequestClaimed = false
     private var bridgeFailureKind: BridgeFailureKind?
     private var bridgeRetryAvailable = false
+    private var bridgeAudioStage: BridgeAudioStage = .idle
     private var activeRequestID: String?
     private var responseText: String?
     private var resultCreatedAt: Date?
@@ -187,6 +188,7 @@ final class AppModel: ObservableObject {
             isServiceReady = true
             status = .ready
             resetBridgeToIdle(clearRequest: true)
+            bridgeAudioStage = .standbySessionReady
             lastError = nil
             markBridgeChanged()
         } catch {
@@ -400,6 +402,7 @@ final class AppModel: ObservableObject {
         activeRequestID = requestID
         bridgeStatus = .starting
         bridgeRequestClaimed = true
+        bridgeAudioStage = .claimed
         bridgeFailureKind = nil
         bridgeRetryAvailable = false
         responseText = nil
@@ -430,15 +433,27 @@ final class AppModel: ObservableObject {
 
         do {
             if !backgroundWakeReady {
+                bridgeAudioStage = .restoringStandby
+                markBridgeChanged()
+
                 guard await restoreBackgroundExecution() else {
                     throw BackgroundAnchorError.couldNotStart
                 }
             }
 
             try await audioSessionCoordinator.beginAndWait(.capture)
+            bridgeAudioStage = .captureSessionReady
+            markBridgeChanged()
+
+            // Same persistent playAndRecord profile as standby. This begin()
+            // changes logical ownership only; it should not mutate category.
             try? backgroundAnchor.start()
 
+            bridgeAudioStage = .startingInput
+            markBridgeChanged()
             _ = try await startMicrophoneWithRecovery()
+            bridgeAudioStage = .firstBuffer
+            markBridgeChanged()
 
             guard activeRequestID == requestID,
                   !Task.isCancelled else {
@@ -454,6 +469,7 @@ final class AppModel: ObservableObject {
 
             bridgeStatus = .recording
             bridgeRequestClaimed = true
+            bridgeAudioStage = .recording
             bridgeFailureKind = nil
             bridgeRetryAvailable = false
             status = .recording
@@ -537,7 +553,8 @@ final class AppModel: ObservableObject {
 
                 guard attempt < 2 else { break }
 
-                try? await audioSessionCoordinator.reassertCurrentProfile()
+                // Rebuild only the cold microphone graph. Do not force
+                // AVAudioSession category/activation from the background.
                 try? backgroundAnchor.start()
                 try await Task.sleep(for: .milliseconds(150 * (attempt + 1)))
             }
@@ -556,6 +573,8 @@ final class AppModel: ObservableObject {
 
         // Re-establish the non-microphone background anchor before shutting down
         // input so there is no suspension gap.
+        bridgeAudioStage = .returningToStandby
+        markBridgeChanged()
         try? backgroundAnchor.start()
 
         guard let fileURL = microphoneCapture.finishRecording() else {
@@ -577,12 +596,14 @@ final class AppModel: ObservableObject {
         preservedAudioURL = fileURL
         preservedAudioRequestID = requestID
 
+        bridgeAudioStage = .transcribing
         beginProcessing(fileURL: fileURL, requestID: requestID)
     }
 
     private func beginProcessing(fileURL: URL, requestID: String) {
         bridgeStatus = .transcribing
         bridgeRequestClaimed = true
+        bridgeAudioStage = .transcribing
         bridgeFailureKind = nil
         bridgeRetryAvailable = false
         status = .transcribing
@@ -643,6 +664,7 @@ final class AppModel: ObservableObject {
         discardPreservedAudio()
 
         resetBridgeToIdle(clearRequest: false)
+        bridgeAudioStage = isServiceReady ? .standbySessionReady : .idle
         status = isServiceReady ? .ready : .idle
         lastError = nil
         markBridgeChanged()
@@ -707,6 +729,7 @@ final class AppModel: ObservableObject {
 
             lastTranscript = raw
             bridgeStatus = .polishing
+            bridgeAudioStage = .polishing
             bridgeFailureKind = nil
             bridgeRetryAvailable = false
             status = .polishing
@@ -739,6 +762,7 @@ final class AppModel: ObservableObject {
             bridgeRetryAvailable = false
             bridgeRequestClaimed = true
             bridgeStatus = .completed
+            bridgeAudioStage = isServiceReady ? .standbySessionReady : .idle
             status = isServiceReady ? .ready : .idle
             lastTranscript = finalText
             refreshAuthState()
@@ -846,20 +870,30 @@ final class AppModel: ObservableObject {
             activeRequestID = requestID
         }
 
+        let stageAtFailure = bridgeAudioStage
+        let surfacedMessage: String
+        if kind == .audioStartFailed || kind == .bridgeUnavailable {
+            surfacedMessage = "\(message) [audio: \(stageAtFailure.rawValue)]"
+        } else {
+            surfacedMessage = message
+        }
+
         responseText = nil
         resultCreatedAt = Date()
-        bridgeError = message
+        bridgeError = surfacedMessage
         bridgeStatus = .error
         bridgeFailureKind = kind
         bridgeRetryAvailable = retryAvailable
         bridgeRequestClaimed = claimed
-        lastError = message
+        bridgeAudioStage = .failed
+        lastError = surfacedMessage
         markBridgeChanged()
     }
 
     private func resetBridgeToIdle(clearRequest: Bool) {
         bridgeStatus = .idle
         bridgeRequestClaimed = false
+        bridgeAudioStage = .idle
         bridgeFailureKind = nil
         bridgeRetryAvailable = false
         responseText = nil
@@ -895,6 +929,7 @@ final class AppModel: ObservableObject {
             backgroundWakeReady: backgroundWakeReady,
             microphoneReady: microphoneCapture.isActive,
             requestClaimed: bridgeRequestClaimed,
+            audioStage: bridgeAudioStage,
             status: bridgeStatus,
             failureKind: bridgeFailureKind,
             retryAvailable: bridgeRetryAvailable,
