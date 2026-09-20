@@ -5,6 +5,8 @@ enum DarwinEvent: String {
     // payload-free wake signals. Request data still travels through LocalBridge,
     // because TypeVoice's AltServer/free-signing path cannot rely on App Groups.
     case heartbeat = "com.miketoryan.typevoice.heartbeat"
+    case keyboardVisible = "com.miketoryan.typevoice.keyboardVisible"
+    case keyboardHidden = "com.miketoryan.typevoice.keyboardHidden"
     case startRecording = "com.miketoryan.typevoice.startRecording"
     case stopRecording = "com.miketoryan.typevoice.stopRecording"
     case cancelRecording = "com.miketoryan.typevoice.cancelRecording"
