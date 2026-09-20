@@ -130,12 +130,11 @@ final class MicrophoneCapture {
     /// checked from the audio render callback itself rather than a background
     /// Timer/Task, so the 10 s / 30 s / 1 min / 5 min window remains reliable
     /// while the app is backgrounded.
-    func setStandbyExpiry(after seconds: Int) {
+    func setStandbyExpiry(after seconds: TimeInterval) {
         lock.lock()
         standbyGeneration &+= 1
-        if recordingFile == nil {
-            standbyExpiryTimestamp = Date().timeIntervalSince1970
-                + TimeInterval(max(10, seconds))
+        if recordingFile == nil, seconds > 0 {
+            standbyExpiryTimestamp = Date().timeIntervalSince1970 + seconds
         } else {
             standbyExpiryTimestamp = 0
         }
