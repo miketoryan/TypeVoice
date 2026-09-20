@@ -66,6 +66,7 @@ struct BridgeState: Codable, Sendable {
     let serverID: String?
     let revision: UInt64
     let serviceReady: Bool
+    let quickDictationEnabled: Bool?
     let backgroundWakeReady: Bool
     let microphoneReady: Bool
     let requestClaimed: Bool
@@ -83,6 +84,7 @@ struct BridgeState: Codable, Sendable {
         serverID: String?,
         revision: UInt64,
         serviceReady: Bool,
+        quickDictationEnabled: Bool? = nil,
         backgroundWakeReady: Bool = false,
         microphoneReady: Bool = false,
         requestClaimed: Bool = false,
@@ -99,6 +101,7 @@ struct BridgeState: Codable, Sendable {
         self.serverID = serverID
         self.revision = revision
         self.serviceReady = serviceReady
+        self.quickDictationEnabled = quickDictationEnabled
         self.backgroundWakeReady = backgroundWakeReady
         self.microphoneReady = microphoneReady
         self.requestClaimed = requestClaimed
@@ -121,6 +124,7 @@ struct BridgeState: Codable, Sendable {
             serverID: nil,
             revision: 0,
             serviceReady: false,
+            quickDictationEnabled: nil,
             backgroundWakeReady: false,
             microphoneReady: false,
             requestClaimed: false,
