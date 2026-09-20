@@ -2,7 +2,7 @@ import Foundation
 
 enum LocalBridge {
     static let port = 14_558
-    static let protocolVersion = "5"
+    static let protocolVersion = "6"
     static let keyboardHeartbeatInterval: Duration = .seconds(2)
     static let resultValidity: TimeInterval = 300
 
@@ -49,6 +49,21 @@ enum BridgeFailureKind: String, Codable, Sendable {
     case interrupted
 }
 
+enum BridgeAudioStage: String, Codable, Sendable {
+    case idle
+    case standbySessionReady
+    case claimed
+    case restoringStandby
+    case captureSessionReady
+    case startingInput
+    case firstBuffer
+    case recording
+    case returningToStandby
+    case transcribing
+    case polishing
+    case failed
+}
+
 struct BridgeState: Codable, Sendable {
     let serverID: String?
     let revision: UInt64
@@ -56,6 +71,7 @@ struct BridgeState: Codable, Sendable {
     let backgroundWakeReady: Bool
     let microphoneReady: Bool
     let requestClaimed: Bool
+    let audioStage: BridgeAudioStage
     let status: BridgeStatus
     let failureKind: BridgeFailureKind?
     let retryAvailable: Bool
@@ -72,6 +88,7 @@ struct BridgeState: Codable, Sendable {
         backgroundWakeReady: Bool = false,
         microphoneReady: Bool = false,
         requestClaimed: Bool = false,
+        audioStage: BridgeAudioStage = .idle,
         status: BridgeStatus,
         failureKind: BridgeFailureKind? = nil,
         retryAvailable: Bool = false,
@@ -87,6 +104,7 @@ struct BridgeState: Codable, Sendable {
         self.backgroundWakeReady = backgroundWakeReady
         self.microphoneReady = microphoneReady
         self.requestClaimed = requestClaimed
+        self.audioStage = audioStage
         self.status = status
         self.failureKind = failureKind
         self.retryAvailable = retryAvailable
@@ -108,6 +126,7 @@ struct BridgeState: Codable, Sendable {
             backgroundWakeReady: false,
             microphoneReady: false,
             requestClaimed: false,
+            audioStage: .idle,
             status: .idle,
             failureKind: .bridgeUnavailable,
             retryAvailable: false,
