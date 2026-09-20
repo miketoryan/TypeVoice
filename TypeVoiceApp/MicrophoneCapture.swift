@@ -11,6 +11,7 @@ final class MicrophoneCapture {
     private var tapInstalled = false
     private var receivedWarmBuffer = false
     private var receivedRecordingBuffer = false
+    private var lastAudioBufferTimestamp: TimeInterval = 0
     private var standbyExpiryTimestamp: TimeInterval = 0
     private var standbyGeneration: UInt64 = 0
 
@@ -33,7 +34,7 @@ final class MicrophoneCapture {
     var isWarmReady: Bool {
         engine?.isRunning == true
             && tapInstalled
-            && hasReceivedWarmBuffer
+            && hasRecentAudioFlow
     }
 
     var isStandbyReady: Bool {
@@ -89,6 +90,7 @@ final class MicrophoneCapture {
         lock.lock()
         receivedWarmBuffer = false
         receivedRecordingBuffer = false
+        lastAudioBufferTimestamp = 0
         lock.unlock()
 
         // Use the input bus's live format. Passing nil is more resilient across
@@ -232,6 +234,7 @@ final class MicrophoneCapture {
         recordingURL = nil
         receivedWarmBuffer = false
         receivedRecordingBuffer = false
+        lastAudioBufferTimestamp = 0
         standbyGeneration &+= 1
         standbyExpiryTimestamp = 0
         lock.unlock()
@@ -262,6 +265,21 @@ final class MicrophoneCapture {
         return receivedWarmBuffer
     }
 
+    /// AVAudioEngine.isRunning can stay true for a zombie input graph after a
+    /// route/interruption/suspension event. Treat the warm path as healthy only
+    /// if the tap has delivered a real buffer recently.
+    private var hasRecentAudioFlow: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard receivedWarmBuffer,
+              lastAudioBufferTimestamp > 0 else {
+            return false
+        }
+
+        return Date().timeIntervalSince1970 - lastAudioBufferTimestamp < 2.5
+    }
+
     private var hasReceivedRecordingBuffer: Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -274,6 +292,7 @@ final class MicrophoneCapture {
 
         lock.lock()
         receivedWarmBuffer = true
+        lastAudioBufferTimestamp = now
 
         if let file = recordingFile {
             receivedRecordingBuffer = true
