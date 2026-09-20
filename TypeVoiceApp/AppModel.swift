@@ -39,6 +39,7 @@ final class AppModel: ObservableObject {
     private var recordingStartTask: Task<Bool, Never>?
     private var recordingStartRequestID: String?
     private var backgroundRestoreTask: Task<Bool, Never>?
+    private var darwinObservations: [DarwinObservation] = []
 
     init() {
         audioSessionCoordinator.onInterruptionBegan = { [weak self] in
@@ -88,6 +89,7 @@ final class AppModel: ObservableObject {
             lastError = error.localizedDescription
         }
 
+        configureDarwinCommandObservers()
         refreshAuthState()
     }
 
@@ -96,6 +98,7 @@ final class AppModel: ObservableObject {
         loginTask?.cancel()
         recordingStartTask?.cancel()
         backgroundRestoreTask?.cancel()
+        darwinObservations.removeAll()
         localBridge.stop()
     }
 
@@ -191,6 +194,7 @@ final class AppModel: ObservableObject {
             bridgeAudioStage = .standbySessionReady
             lastError = nil
             markBridgeChanged()
+            DarwinBus.post(.serviceChanged)
         } catch {
             backgroundAnchor.stop()
             audioSessionCoordinator.reset()
@@ -222,6 +226,7 @@ final class AppModel: ObservableObject {
         status = .idle
         resetBridgeToIdle(clearRequest: true)
         markBridgeChanged()
+        DarwinBus.post(.serviceChanged)
     }
 
     func handleOpenURL(_ url: URL) {
@@ -311,6 +316,46 @@ final class AppModel: ObservableObject {
             return "\(email) · \(plan.capitalized)"
         }
         return email
+    }
+
+    private func configureDarwinCommandObservers() {
+        darwinObservations.removeAll()
+
+        let events: [DarwinEvent] = [
+            .heartbeat,
+            .startRecording,
+            .stopRecording,
+            .cancelRecording,
+            .retryProcessing,
+            .acknowledgeResult
+        ]
+
+        darwinObservations = events.map { event in
+            DarwinBus.observe(event) { [weak self] in
+                Task { @MainActor in
+                    self?.handleDarwinWake(event)
+                }
+            }
+        }
+    }
+
+    /// Darwin is the wake signal; LocalBridge carries the command payload.
+    /// Receiving this callback is intentionally cheap so the listener can accept
+    /// the HTTP command immediately afterwards.
+    private func handleDarwinWake(_ event: DarwinEvent) {
+        guard isServiceReady else { return }
+
+        if !backgroundWakeReady, !microphoneCapture.isActive {
+            bridgeAudioStage = .restoringStandby
+            markBridgeChanged()
+
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                _ = await self.restoreBackgroundExecution()
+            }
+        } else if event == .heartbeat {
+            DarwinBus.post(.serviceChanged)
+        }
     }
 
     private func handleBridgeRequest(_ request: BridgeRequest) async -> BridgeState {
@@ -943,5 +988,10 @@ final class AppModel: ObservableObject {
 
     private func markBridgeChanged() {
         bridgeRevision &+= 1
+        DarwinBus.post(.statusChanged)
+
+        if bridgeStatus == .completed {
+            DarwinBus.post(.resultReady)
+        }
     }
 }
