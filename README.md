@@ -1,67 +1,110 @@
 # TypeVoice
 
-TypeVoice is an iOS AI voice keyboard focused on one job: tap the microphone, speak naturally, and have cleaned text inserted directly at the current cursor.
+TypeVoice is an iOS AI voice keyboard focused on one job: tap the microphone, speak naturally, and insert cleaned text directly at the current cursor.
 
-## Target behavior
+## Current behavior
+
+TypeVoice uses a **finite warm-microphone window**, not an indefinitely wakeable background service.
 
 ```
-Tap TypeVoice microphone
+TypeVoice keyboard becomes visible
         ↓
-If the background audio service is ready
+If microphone is warm
         ↓
-Stay in the current app
+Record immediately without leaving the current app
         ↓
-Record
+Stop recording
         ↓
-OpenAI speech-to-text
-        ↓
-Automatically detect Chinese / English / mixed speech
-        ↓
-AI cleanup
-- remove filler words
-- remove repetitions
-- resolve obvious self-corrections
-- remove abandoned fragments
-- add natural punctuation
+Transcribe + clean up
         ↓
 UITextDocumentProxy.insertText(...)
         ↓
 Text appears at the current cursor
 ```
 
-There is **no Chinese/English recognition switch** on the keyboard. The language option in TypeVoice settings controls only the TypeVoice interface language.
+When the TypeVoice keyboard is dismissed or switched away from, the selected warm window starts:
 
-There is **no Picture in Picture (PiP)** design.
+- 10 seconds
+- 30 seconds
+- 1 minute
+- 5 minutes
+
+While the TypeVoice keyboard remains visible, **no standby countdown runs**.
+
+When the warm window expires, TypeVoice releases microphone input and enters **cold standby**. Quick Dictation remains enabled. The next keyboard use opens TypeVoice briefly, waits until the containing app is fully foreground-active, rebuilds the audio session and microphone graph, starts dictation, then returns to the original input app.
 
 ## iOS constraint
 
-Apple does not allow a custom keyboard extension to access the microphone directly. TypeVoice therefore uses:
+Apple does not allow a custom keyboard extension to own microphone input directly. TypeVoice therefore uses:
 
 - the containing app for microphone ownership and transcription;
-- an App Group for shared state;
-- Darwin notifications for lightweight cross-process start/stop/result signals;
-- `UITextDocumentProxy` in the keyboard extension for direct insertion.
+- a persistent input tap during the finite warm window;
+- a separate silent-output anchor only to improve short background residency;
+- LocalBridge on 127.0.0.1 for app/keyboard command and state exchange;
+- Darwin notifications only for lightweight visibility, command and result signals;
+- a real user-tapped SwiftUI `Link` for cold foreground activation;
+- `UITextDocumentProxy` for final text insertion.
 
-In the v0.20 ActiveSession experiment, TypeVoice starts one AVAudioEngine while the containing app is foregrounded. Standby keeps only a looping silent output path alive; the microphone input tap is absent. A keyboard dictation attaches the input tap to that already-running engine and removes it again when recording stops. This specifically avoids calling AVAudioEngine.start() from the background between dictations. If iOS has invalidated the running audio graph, the keyboard falls back to opening TypeVoice so the graph can be rebuilt in the foreground.
+There is no Picture in Picture design.
 
-## Current scope — v0.1
+## Warm and cold paths
 
-- iOS 16+
-- TypeVoice app + custom keyboard extension
-- background-ready output-only ActiveSession service
-- input-tap start/stop without background AVAudioEngine restart
-- foreground recovery fallback when the active graph is invalidated
-- OpenAI transcription (default model is configurable)
-- OpenAI text cleanup (default model is configurable)
-- automatic language detection by speech/model pipeline
-- direct insertion with duplicate-result protection
-- API key stored in Keychain
-- Chinese / English UI setting only
-- 10 / 20 / 60 minute ready windows
+### Warm path
+
+If the foreground-started microphone engine is healthy and still receiving real audio buffers, tapping the keyboard microphone opens only the recording-file gate. It does **not** restart AVAudioEngine or rebuild AVAudioSession in the background.
+
+### Cold path
+
+If microphone flow has ended, the keyboard does not spend time repeatedly trying to restart microphone IO from the background. It presents a real foreground activation link.
+
+The containing app parks the keyboard request until `UIApplication.shared.applicationState == .active`. Only then does it:
+
+1. clear the old microphone graph;
+2. wait for ordered AVAudioSession teardown to finish;
+3. reactivate the recording session;
+4. rebuild and start the input engine;
+5. verify real audio buffers are arriving;
+6. start recording if requested;
+7. return to the original app.
+
+This avoids the `AUIOClient_StartIO / 2003329396` failure caused by trying to start microphone IO before the containing app is truly foreground-active.
+
+## State model
+
+Quick Dictation and microphone temperature are separate states.
+
+- **Quick Dictation disabled** — user explicitly turned the feature off.
+- **Quick Dictation enabled + warm** — keyboard can record immediately.
+- **Quick Dictation enabled + cold** — microphone has been released; next keyboard use foreground-activates TypeVoice.
+- **Recording / transcribing / cleaning** — active request states.
+
+Standby timeout never disables Quick Dictation by itself.
+
+## Audio behavior
+
+TypeVoice uses a non-mixing `.playAndRecord` session while the warm microphone is active. If music is playing, iOS pauses competing playback while TypeVoice owns the session. When the warm session is released, TypeVoice deactivates with `.notifyOthersOnDeactivation`, allowing the previous audio app to resume when supported by iOS/the player.
+
+## Language behavior
+
+There is no Chinese/English recognition switch on the keyboard. Speech language is detected automatically by the speech/model pipeline, including mixed Chinese and English.
+
+The Chinese/English setting in TypeVoice changes only the interface language.
+
+## Reliability rules
+
+The current architecture deliberately avoids several older experiments:
+
+- no periodic keyboard heartbeat used as a background keep-alive;
+- no 1.5-second background claim/retry loop before foreground activation;
+- no hidden programmatic recovery launcher after a failed warm start;
+- no attempt to rebuild microphone input from a Darwin/background callback;
+- no trust in `AVAudioEngine.isRunning` alone — recent real input buffers are required;
+- stale standby-timeout callbacks are generation-checked so an old timeout cannot tear down a newly warmed microphone;
+- AVAudioSession teardown/re-activation is serialized so delayed `setActive(false)` cannot race a new `setActive(true)`.
 
 ## Build
 
-This repository uses [XcodeGen](https://github.com/yonaskolb/XcodeGen) so the Xcode project is generated from `project.yml`.
+The project uses XcodeGen.
 
 ```bash
 brew install xcodegen
@@ -73,33 +116,24 @@ open TypeVoice.xcodeproj
 
 In Xcode:
 
-1. Select your Apple Developer Team for both **TypeVoice** and **TypeVoiceKeyboard**.
-2. Confirm the App Group exists for both targets: `group.com.miketoryan.typevoice`.
+1. Select your Apple Developer Team for TypeVoice and TypeVoiceKeyboard.
+2. Confirm the App Group entitlement if using a signing setup that supports it.
 3. Build and install on a real iPhone.
-4. On iPhone, go to **Settings → General → Keyboard → Keyboards → Add New Keyboard → TypeVoice**.
-5. Enable **Allow Full Access** for TypeVoice. App Group communication requires it.
-6. Open TypeVoice once, grant microphone permission, enter an OpenAI API key, then tap **Enable Quick Dictation**.
-7. Switch to TypeVoice in any text field and tap the microphone.
-
-> ChatGPT Plus and OpenAI API billing are separate. TypeVoice uses an OpenAI API key; a ChatGPT Plus subscription by itself does not provide API credits.
-
-## Privacy
-
-Audio is captured by the TypeVoice containing app. In the default configuration it is uploaded to the configured OpenAI-compatible API for transcription, and the resulting transcript is sent for cleanup. TypeVoice does not intentionally send text from the host app to the model.
-
-The v0.20 design keeps background execution alive with silent output while no input tap is installed during standby. The microphone path is attached only during an actual dictation and removed immediately afterwards. iOS still controls the privacy indicator and may change audio-session behavior across OS versions, so this behavior is being validated on real devices.
+4. Add TypeVoice under Settings → General → Keyboard → Keyboards.
+5. Enable Allow Full Access.
+6. Open TypeVoice, sign in with ChatGPT, and enable Quick Dictation.
 
 ## Design references
 
-The architecture was independently implemented after studying several open-source iOS voice-keyboard projects, especially:
+The architecture was independently implemented after studying several open-source iOS voice-keyboard projects, particularly:
 
-- Dictus iOS — MIT
-- VivaDicta — MIT
-- VocaPhone — AGPL-3.0, architecture/behavior reference only
-- Sayboard — GPL-3.0, architecture/behavior reference only
+- Dictus iOS — cold starts are deferred until the app is truly active; warm and cold engine paths are explicitly separated.
+- DICTATOR — microphone input is never restarted from the background; audio-engine mutations are serialized; silent output is treated as residency support rather than microphone health.
+- VivaDicta — finite prewarm sessions keep one input engine/tap alive and terminate the session on timeout.
+- Sayboard — one persistent audio session/tap is kept for a bounded session and recording is gated separately from engine lifetime.
 
-No source code from copyleft projects is copied into TypeVoice.
+No copyleft source code is copied into TypeVoice.
 
-## Status
+## Version
 
-v0.1 is the first architecture build. It is intended for on-device testing before UI polish and App Store hardening.
+Current development line: v0.21.
