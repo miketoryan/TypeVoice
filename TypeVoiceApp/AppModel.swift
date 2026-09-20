@@ -1,6 +1,7 @@
 import AVFoundation
 import Foundation
 import SwiftUI
+import UIKit
 
 @MainActor
 final class AppModel: ObservableObject {
@@ -263,35 +264,30 @@ final class AppModel: ObservableObject {
         let cameFromKeyboard = source == "keyboard"
 
         Task {
-            if !isServiceReady {
-                await arm()
-            } else if !backgroundWakeReady {
-                do {
-                    // This path runs because the keyboard has foregrounded
-                    // TypeVoice. Rebuilding microphone input is therefore legal.
-                    try await audioSessionCoordinator.reassertCurrentProfile()
-                    try await microphoneCapture.warmUp()
-                    try backgroundAnchor.start()
-                    microphoneCapture.clearStandbyExpiry()
-                    bridgeAudioStage = .standbySessionReady
-                    lastError = nil
-                    markBridgeChanged()
-                } catch {
-                    publishBridgeError(
-                        error.localizedDescription,
-                        requestID: requestedRecordingID,
-                        kind: .audioStartFailed,
-                        retryAvailable: false,
-                        claimed: true
-                    )
-                    status = .failed
-                    return
-                }
+            if cameFromKeyboard {
+                activationHandoffInProgress = true
             }
 
-            guard cameFromKeyboard, isServiceReady else { return }
+            let audioReady: Bool
 
-            if shouldAutoStart,
+            if backgroundWakeReady {
+                microphoneCapture.clearStandbyExpiry()
+                audioReady = true
+            } else if cameFromKeyboard {
+                // URL delivery can happen before the app has fully transitioned
+                // to UIApplication.State.active. Wait for the foreground state,
+                // then retry the microphone graph a few times if CoreAudio is
+                // still settling from the app switch.
+                audioReady = await prepareForegroundWarmSession(
+                    requestID: requestedRecordingID
+                )
+            } else {
+                await arm()
+                audioReady = backgroundWakeReady
+            }
+
+            if audioReady,
+               shouldAutoStart,
                let requestedRecordingID,
                !requestedRecordingID.isEmpty {
                 claimRecordingRequest(
@@ -299,33 +295,155 @@ final class AppModel: ObservableObject {
                     forceAudioRetry: true
                 )
 
-                let started: Bool
-                if bridgeStatus == .recording,
-                   activeRequestID == requestedRecordingID {
-                    started = true
-                } else if recordingStartRequestID == requestedRecordingID,
-                          let recordingStartTask {
-                    started = await recordingStartTask.value
-                } else {
-                    started = false
-                }
-
-                guard started,
-                      bridgeStatus == .recording,
-                      activeRequestID == requestedRecordingID else {
-                    return
+                if bridgeStatus != .recording
+                    || activeRequestID != requestedRecordingID {
+                    if recordingStartRequestID == requestedRecordingID,
+                       let recordingStartTask {
+                        _ = await recordingStartTask.value
+                    }
                 }
             }
 
-            try? await Task.sleep(for: .milliseconds(220))
-
-            guard let requestedHostBundleID,
-                  !requestedHostBundleID.isEmpty else {
-                return
+            // IMPORTANT: returning to the original host is independent of audio
+            // success. A failed microphone activation must never strand the user
+            // inside TypeVoice. The keyboard will show the published error after
+            // the return and can retry with another user tap.
+            if cameFromKeyboard,
+               let requestedHostBundleID,
+               !requestedHostBundleID.isEmpty {
+                try? await Task.sleep(
+                    for: audioReady ? .milliseconds(220) : .milliseconds(320)
+                )
+                _ = PreviousAppReturner.open(bundleID: requestedHostBundleID)
             }
 
-            _ = PreviousAppReturner.open(bundleID: requestedHostBundleID)
+            activationHandoffInProgress = false
         }
+    }
+
+    private func prepareForegroundWarmSession(
+        requestID: String?
+    ) async -> Bool {
+        guard authManager.isLoggedIn else {
+            refreshAuthState()
+            publishBridgeError(
+                "Sign in with ChatGPT first.",
+                requestID: requestID,
+                kind: .authRequired,
+                retryAvailable: false,
+                claimed: true
+            )
+            status = .failed
+            return false
+        }
+
+        guard await waitUntilApplicationIsActive() else {
+            publishBridgeError(
+                "TypeVoice did not become active in time. Tap the microphone to try again.",
+                requestID: requestID,
+                kind: .audioStartFailed,
+                retryAvailable: false,
+                claimed: true
+            )
+            status = .failed
+            return false
+        }
+
+        let granted = await microphoneCapture.requestPermission()
+        guard granted else {
+            publishBridgeError(
+                "Microphone permission is required.",
+                requestID: requestID,
+                kind: .audioStartFailed,
+                retryAvailable: false,
+                claimed: true
+            )
+            status = .failed
+            return false
+        }
+
+        var finalError: Error?
+
+        for attempt in 0..<3 {
+            microphoneCapture.shutdown()
+            backgroundAnchor.stop()
+
+            if attempt > 0 {
+                audioSessionCoordinator.reset()
+                try? await Task.sleep(for: .milliseconds(140))
+            }
+
+            do {
+                try await audioSessionCoordinator.beginAndWait(.backgroundKeepAlive)
+
+                // A short foreground settle delay substantially reduces the
+                // kAUStartIO/no-buffer race immediately after an app switch.
+                if attempt == 0 {
+                    try? await Task.sleep(for: .milliseconds(90))
+                }
+
+                try await microphoneCapture.warmUp(
+                    firstBufferTimeout: .milliseconds(1_300)
+                )
+                try backgroundAnchor.start()
+
+                isServiceReady = true
+                status = .ready
+                bridgeAudioStage = .standbySessionReady
+                lastError = nil
+                bridgeError = nil
+                bridgeFailureKind = nil
+                bridgeRetryAvailable = false
+                microphoneCapture.clearStandbyExpiry()
+                markBridgeChanged()
+                DarwinBus.post(.serviceChanged)
+                return true
+            } catch {
+                finalError = error
+                microphoneCapture.shutdown()
+                backgroundAnchor.stop()
+                isServiceReady = false
+
+                if attempt < 2 {
+                    try? await Task.sleep(for: .milliseconds(160))
+                }
+            }
+        }
+
+        audioSessionCoordinator.reset()
+
+        let message = finalError?.localizedDescription
+            ?? "Microphone activation failed."
+
+        publishBridgeError(
+            message,
+            requestID: requestID,
+            kind: .audioStartFailed,
+            retryAvailable: false,
+            claimed: true
+        )
+        status = .failed
+        return false
+    }
+
+    private func waitUntilApplicationIsActive(
+        timeout: Duration = .milliseconds(1_500)
+    ) async -> Bool {
+        let startedAt = ContinuousClock.now
+
+        while UIApplication.shared.applicationState != .active {
+            if ContinuousClock.now - startedAt >= timeout {
+                return false
+            }
+
+            do {
+                try await Task.sleep(for: .milliseconds(40))
+            } catch {
+                return false
+            }
+        }
+
+        return true
     }
 
     func appBecameActive() {
