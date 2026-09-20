@@ -22,14 +22,21 @@ final class AppModel: ObservableObject {
 
     private var bridgeRevision: UInt64 = 0
     private var bridgeStatus: BridgeStatus = .idle
+    private var bridgeRequestClaimed = false
+    private var bridgeFailureKind: BridgeFailureKind?
+    private var bridgeRetryAvailable = false
     private var activeRequestID: String?
     private var responseText: String?
     private var resultCreatedAt: Date?
     private var bridgeError: String?
 
+    private var preservedAudioURL: URL?
+    private var preservedAudioRequestID: String?
+
     private var processingTask: Task<Void, Never>?
     private var loginTask: Task<Void, Never>?
     private var recordingStartTask: Task<Bool, Never>?
+    private var recordingStartRequestID: String?
     private var backgroundRestoreTask: Task<Bool, Never>?
 
     init() {
@@ -47,8 +54,21 @@ final class AppModel: ObservableObject {
         audioSessionCoordinator.onMediaServicesReset = { [weak self] in
             guard let self else { return }
             Task { @MainActor in
+                let interruptedRequestID = self.activeRequestID
                 self.microphoneCapture.stopAndDiscard()
+                try? await self.audioSessionCoordinator.endAndWait(.capture)
                 _ = await self.restoreBackgroundExecution(forceReassert: true)
+
+                if let interruptedRequestID {
+                    self.publishBridgeError(
+                        "The iPhone audio service restarted. Tap the microphone to try again.",
+                        requestID: interruptedRequestID,
+                        kind: .interrupted,
+                        retryAvailable: false,
+                        claimed: true
+                    )
+                    self.status = .failed
+                }
             }
         }
 
@@ -122,11 +142,8 @@ final class AppModel: ObservableObject {
         lastError = nil
     }
 
-    /// Arms Typeless-style background readiness.
-    ///
-    /// The microphone remains fully off here. The silent playback anchor is what
-    /// keeps the containing app executable so a later keyboard command can start
-    /// the microphone on demand without opening TypeVoice.
+    /// Arms background execution only. The microphone stays completely off
+    /// until a keyboard request is actually claimed and capture starts.
     func arm() async {
         guard authManager.isLoggedIn else {
             refreshAuthState()
@@ -157,17 +174,18 @@ final class AppModel: ObservableObject {
 
             isServiceReady = true
             status = .ready
-            bridgeStatus = .idle
-            bridgeError = nil
-            activeRequestID = nil
-            responseText = nil
-            resultCreatedAt = nil
+            resetBridgeToIdle(clearRequest: true)
             lastError = nil
             markBridgeChanged()
         } catch {
             backgroundAnchor.stop()
             audioSessionCoordinator.reset()
-            publishBridgeError(error.localizedDescription)
+            publishBridgeError(
+                error.localizedDescription,
+                kind: .bridgeUnavailable,
+                retryAvailable: false,
+                claimed: false
+            )
             status = .failed
         }
     }
@@ -177,20 +195,18 @@ final class AppModel: ObservableObject {
         processingTask = nil
         recordingStartTask?.cancel()
         recordingStartTask = nil
+        recordingStartRequestID = nil
         backgroundRestoreTask?.cancel()
         backgroundRestoreTask = nil
 
         microphoneCapture.stopAndDiscard()
         backgroundAnchor.stop()
         audioSessionCoordinator.reset()
+        discardPreservedAudio()
 
         isServiceReady = false
         status = .idle
-        bridgeStatus = .idle
-        activeRequestID = nil
-        responseText = nil
-        resultCreatedAt = nil
-        bridgeError = nil
+        resetBridgeToIdle(clearRequest: true)
         markBridgeChanged()
     }
 
@@ -198,41 +214,44 @@ final class AppModel: ObservableObject {
         guard url.scheme?.lowercased() == "typevoice" else { return }
         guard url.host?.lowercased() == "prepare" else { return }
 
-        let components = URLComponents(
-            url: url,
-            resolvingAgainstBaseURL: false
-        )
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         let source = components?.queryItems?
-            .first(where: { $0.name == "source" })?
-            .value
+            .first(where: { $0.name == "source" })?.value
         let requestedHostBundleID = components?.queryItems?
-            .first(where: { $0.name == "host" })?
-            .value
+            .first(where: { $0.name == "host" })?.value
         let requestedRecordingID = components?.queryItems?
-            .first(where: { $0.name == "request" })?
-            .value
+            .first(where: { $0.name == "request" })?.value
         let shouldAutoStart = components?.queryItems?
-            .first(where: { $0.name == "autostart" })?
-            .value == "1"
+            .first(where: { $0.name == "autostart" })?.value == "1"
         let cameFromKeyboard = source == "keyboard"
 
         Task {
             if !isServiceReady {
                 await arm()
-            } else if !backgroundWakeReady {
+            } else if !backgroundWakeReady && !microphoneCapture.isActive {
                 _ = await restoreBackgroundExecution(forceReassert: true)
             }
 
-            guard cameFromKeyboard, isServiceReady else {
-                return
-            }
+            guard cameFromKeyboard, isServiceReady else { return }
 
             if shouldAutoStart,
                let requestedRecordingID,
                !requestedRecordingID.isEmpty {
-                let started = await startRecordingFromKeyboard(
-                    requestID: requestedRecordingID
+                claimRecordingRequest(
+                    requestedRecordingID,
+                    forceAudioRetry: true
                 )
+
+                let started: Bool
+                if bridgeStatus == .recording,
+                   activeRequestID == requestedRecordingID {
+                    started = true
+                } else if recordingStartRequestID == requestedRecordingID,
+                          let recordingStartTask {
+                    started = await recordingStartTask.value
+                } else {
+                    started = false
+                }
 
                 guard started,
                       bridgeStatus == .recording,
@@ -241,14 +260,10 @@ final class AppModel: ObservableObject {
                 }
             }
 
-            // The foreground fallback still starts real capture before returning.
-            // By the time this delay ends the first microphone buffer has already
-            // arrived, so the user lands back in the text field while recording.
             try? await Task.sleep(for: .milliseconds(220))
 
             guard let requestedHostBundleID,
-                  !requestedHostBundleID.isEmpty
-            else {
+                  !requestedHostBundleID.isEmpty else {
                 return
             }
 
@@ -259,7 +274,7 @@ final class AppModel: ObservableObject {
     func appBecameActive() {
         refreshAuthState()
 
-        guard isServiceReady else { return }
+        guard isServiceReady, !microphoneCapture.isActive else { return }
 
         Task {
             _ = await restoreBackgroundExecution(forceReassert: false)
@@ -268,9 +283,6 @@ final class AppModel: ObservableObject {
 
     private var backgroundWakeReady: Bool {
         guard isServiceReady else { return false }
-
-        // During recording the capture engine itself keeps execution alive.
-        // At idle, the playback anchor is the readiness source.
         return backgroundAnchor.isRunning || microphoneCapture.isActive
     }
 
@@ -296,23 +308,166 @@ final class AppModel: ObservableObject {
             if isServiceReady,
                !backgroundWakeReady,
                !microphoneCapture.isActive {
-                _ = await restoreBackgroundExecution()
+                Task { @MainActor [weak self] in
+                    _ = await self?.restoreBackgroundExecution()
+                }
             }
 
         case .startRecording:
-            _ = await startRecordingFromKeyboard(requestID: request.requestID)
+            if let requestID = request.requestID {
+                claimRecordingRequest(requestID)
+            } else {
+                publishBridgeError(
+                    "TypeVoice received an invalid recording request.",
+                    kind: .audioStartFailed,
+                    retryAvailable: false,
+                    claimed: true
+                )
+            }
 
         case .stopRecording:
             await stopRecordingFromKeyboard(expectedRequestID: request.requestID)
 
         case .cancelRecording:
-            await cancelRecordingFromKeyboard(expectedRequestID: request.requestID)
+            await cancelCurrentRequest(expectedRequestID: request.requestID)
+
+        case .retryProcessing:
+            retryProcessing(expectedRequestID: request.requestID)
 
         case .acknowledgeResult:
             acknowledgeResult(requestID: request.requestID)
         }
 
         return currentBridgeState()
+    }
+
+    /// Claims immediately so the keyboard knows the containing app is alive
+    /// before any AudioSession or AVAudioEngine work begins.
+    private func claimRecordingRequest(
+        _ requestID: String,
+        forceAudioRetry: Bool = false
+    ) {
+        guard !requestID.isEmpty else { return }
+
+        if activeRequestID == requestID {
+            if bridgeStatus == .recording || bridgeStatus == .starting {
+                bridgeRequestClaimed = true
+                markBridgeChanged()
+                return
+            }
+
+            if bridgeStatus == .error,
+               bridgeFailureKind == .audioStartFailed,
+               forceAudioRetry {
+                // Reuse the same request ID when foreground fallback retries.
+            } else if bridgeStatus == .transcribing
+                        || bridgeStatus == .polishing
+                        || bridgeStatus == .completed {
+                return
+            }
+        } else {
+            processingTask?.cancel()
+            processingTask = nil
+            recordingStartTask?.cancel()
+            recordingStartTask = nil
+            recordingStartRequestID = nil
+            discardPreservedAudio()
+        }
+
+        guard isServiceReady else {
+            publishBridgeError(
+                "Open TypeVoice and enable Quick Dictation first.",
+                requestID: requestID,
+                kind: .bridgeUnavailable,
+                retryAvailable: false,
+                claimed: false
+            )
+            return
+        }
+
+        activeRequestID = requestID
+        bridgeStatus = .starting
+        bridgeRequestClaimed = true
+        bridgeFailureKind = nil
+        bridgeRetryAvailable = false
+        responseText = nil
+        resultCreatedAt = nil
+        bridgeError = nil
+        status = .starting
+        lastError = nil
+        markBridgeChanged()
+
+        recordingStartTask?.cancel()
+        recordingStartRequestID = requestID
+        recordingStartTask = Task { @MainActor [weak self] in
+            guard let self else { return false }
+            let started = await self.performRecordingStart(requestID: requestID)
+            if self.recordingStartRequestID == requestID {
+                self.recordingStartRequestID = nil
+                self.recordingStartTask = nil
+            }
+            return started
+        }
+    }
+
+    private func performRecordingStart(requestID: String) async -> Bool {
+        guard activeRequestID == requestID,
+              bridgeRequestClaimed else {
+            return false
+        }
+
+        do {
+            if !backgroundWakeReady {
+                guard await restoreBackgroundExecution() else {
+                    throw BackgroundAnchorError.couldNotStart
+                }
+            }
+
+            try await audioSessionCoordinator.beginAndWait(.capture)
+            try? backgroundAnchor.start()
+
+            _ = try await startMicrophoneWithRecovery()
+
+            guard activeRequestID == requestID,
+                  !Task.isCancelled else {
+                microphoneCapture.stopAndDiscard()
+                try? await audioSessionCoordinator.endAndWait(.capture)
+                try? backgroundAnchor.start()
+                return false
+            }
+
+            // Capture itself now owns the background audio execution. Stop the
+            // silent anchor only after real microphone buffers are flowing.
+            backgroundAnchor.stop()
+
+            bridgeStatus = .recording
+            bridgeRequestClaimed = true
+            bridgeFailureKind = nil
+            bridgeRetryAvailable = false
+            status = .recording
+            lastError = nil
+            bridgeError = nil
+            markBridgeChanged()
+            return true
+        } catch is CancellationError {
+            return false
+        } catch {
+            microphoneCapture.stopAndDiscard()
+            try? await audioSessionCoordinator.endAndWait(.capture)
+            try? backgroundAnchor.start()
+
+            guard activeRequestID == requestID else { return false }
+
+            publishBridgeError(
+                error.localizedDescription,
+                requestID: requestID,
+                kind: .audioStartFailed,
+                retryAvailable: false,
+                claimed: true
+            )
+            status = .failed
+            return false
+        }
     }
 
     private func restoreBackgroundExecution(
@@ -356,90 +511,14 @@ final class AppModel: ObservableObject {
         return restored
     }
 
-    private func startRecordingFromKeyboard(requestID: String?) async -> Bool {
-        guard let requestID, !requestID.isEmpty else {
-            publishBridgeError("TypeVoice received an invalid recording request.")
-            return false
-        }
-
-        guard isServiceReady else {
-            publishBridgeError(
-                "Open TypeVoice and enable Quick Dictation first.",
-                requestID: requestID
-            )
-            return false
-        }
-
-        guard bridgeStatus != .starting,
-              bridgeStatus != .recording,
-              bridgeStatus != .transcribing,
-              bridgeStatus != .polishing else {
-            return bridgeStatus == .recording && activeRequestID == requestID
-        }
-
-        if let recordingStartTask {
-            return await recordingStartTask.value
-        }
-
-        bridgeStatus = .starting
-        status = .starting
-        activeRequestID = requestID
-        responseText = nil
-        resultCreatedAt = nil
-        bridgeError = nil
-        markBridgeChanged()
-
-        let task = Task { @MainActor [weak self] in
-            guard let self else { return false }
-
-            do {
-                if !self.backgroundWakeReady {
-                    guard await self.restoreBackgroundExecution() else {
-                        throw BackgroundAnchorError.couldNotStart
-                    }
-                }
-
-                try await self.audioSessionCoordinator.beginAndWait(.capture)
-
-                // The keep-alive player is deliberately left running across the
-                // profile switch. If iOS paused it during the category change,
-                // restart it before starting input so there is no execution gap.
-                try? self.backgroundAnchor.start()
-
-                _ = try await self.startMicrophoneWithRecovery()
-
-                self.bridgeStatus = .recording
-                self.status = .recording
-                self.lastError = nil
-                self.bridgeError = nil
-                self.markBridgeChanged()
-                return true
-            } catch {
-                self.microphoneCapture.stopAndDiscard()
-                try? await self.audioSessionCoordinator.endAndWait(.capture)
-                try? self.backgroundAnchor.start()
-
-                self.publishBridgeError(
-                    error.localizedDescription,
-                    requestID: requestID
-                )
-                self.status = .failed
-                return false
-            }
-        }
-
-        recordingStartTask = task
-        let started = await task.value
-        recordingStartTask = nil
-        return started
-    }
-
     private func startMicrophoneWithRecovery() async throws -> URL {
         var lastError: Error = MicrophoneCaptureError.inputUnavailable
 
         for attempt in 0..<3 {
             do {
                 return try await microphoneCapture.startRecording()
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 lastError = error
                 microphoneCapture.stopAndDiscard()
@@ -463,13 +542,18 @@ final class AppModel: ObservableObject {
             return
         }
 
-        // Preserve background execution first, then shut the input engine down.
-        // The privacy indicator can turn off immediately; transcription happens
-        // afterwards with only the playback anchor alive.
+        // Re-establish the non-microphone background anchor before shutting down
+        // input so there is no suspension gap.
         try? backgroundAnchor.start()
 
         guard let fileURL = microphoneCapture.finishRecording() else {
-            publishBridgeError("Recording file was not available.", requestID: requestID)
+            publishBridgeError(
+                "Recording file was not available.",
+                requestID: requestID,
+                kind: .transcriptionPermanent,
+                retryAvailable: false,
+                claimed: true
+            )
             status = .failed
             return
         }
@@ -477,9 +561,21 @@ final class AppModel: ObservableObject {
         try? await audioSessionCoordinator.endAndWait(.capture)
         try? backgroundAnchor.start()
 
+        discardPreservedAudio()
+        preservedAudioURL = fileURL
+        preservedAudioRequestID = requestID
+
+        beginProcessing(fileURL: fileURL, requestID: requestID)
+    }
+
+    private func beginProcessing(fileURL: URL, requestID: String) {
         bridgeStatus = .transcribing
+        bridgeRequestClaimed = true
+        bridgeFailureKind = nil
+        bridgeRetryAvailable = false
         status = .transcribing
         bridgeError = nil
+        resultCreatedAt = nil
         markBridgeChanged()
 
         processingTask?.cancel()
@@ -488,51 +584,90 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func cancelRecordingFromKeyboard(expectedRequestID: String?) async {
+    private func retryProcessing(expectedRequestID: String?) {
+        guard bridgeStatus == .error,
+              bridgeRetryAvailable,
+              bridgeFailureKind == .transcriptionRecoverable,
+              let requestID = activeRequestID,
+              expectedRequestID == nil || expectedRequestID == requestID,
+              preservedAudioRequestID == requestID,
+              let fileURL = preservedAudioURL,
+              FileManager.default.fileExists(atPath: fileURL.path)
+        else {
+            return
+        }
+
+        beginProcessing(fileURL: fileURL, requestID: requestID)
+    }
+
+    private func cancelCurrentRequest(expectedRequestID: String?) async {
         guard expectedRequestID == nil || expectedRequestID == activeRequestID else {
             return
         }
+
+        // Invalidate the request before awaiting anything. Any late network or
+        // audio result for the old ID is ignored by the request-ID guards.
+        activeRequestID = nil
+        bridgeRequestClaimed = false
 
         processingTask?.cancel()
         processingTask = nil
         recordingStartTask?.cancel()
         recordingStartTask = nil
+        recordingStartRequestID = nil
 
-        try? backgroundAnchor.start()
-        microphoneCapture.stopAndDiscard()
-        try? await audioSessionCoordinator.endAndWait(.capture)
-        try? backgroundAnchor.start()
+        let hadCapture =
+            microphoneCapture.isActive
+            || bridgeStatus == .recording
+            || bridgeStatus == .starting
 
-        activeRequestID = nil
-        responseText = nil
-        resultCreatedAt = nil
-        bridgeError = nil
-        bridgeStatus = .idle
+        if hadCapture {
+            try? backgroundAnchor.start()
+            microphoneCapture.stopAndDiscard()
+            try? await audioSessionCoordinator.endAndWait(.capture)
+            try? backgroundAnchor.start()
+        }
+
+        discardPreservedAudio()
+
+        resetBridgeToIdle(clearRequest: false)
         status = isServiceReady ? .ready : .idle
+        lastError = nil
         markBridgeChanged()
     }
 
     private func audioInterruptionBegan() {
         guard isServiceReady else { return }
 
-        markBridgeChanged()
+        let interruptedRequestID = activeRequestID
 
-        guard microphoneCapture.isActive || bridgeStatus == .recording else {
+        guard microphoneCapture.isActive
+                || bridgeStatus == .recording
+                || bridgeStatus == .starting else {
+            markBridgeChanged()
             return
         }
 
-        let interruptedRequestID = activeRequestID
+        recordingStartTask?.cancel()
+        recordingStartTask = nil
+        recordingStartRequestID = nil
 
         Task { @MainActor [weak self] in
             guard let self else { return }
 
+            try? self.backgroundAnchor.start()
             self.microphoneCapture.stopAndDiscard()
             try? await self.audioSessionCoordinator.endAndWait(.capture)
+            try? self.backgroundAnchor.start()
 
-            if let interruptedRequestID {
+            if let interruptedRequestID,
+               self.activeRequestID == interruptedRequestID {
                 self.publishBridgeError(
                     "Microphone session was interrupted.",
-                    requestID: interruptedRequestID
+                    requestID: interruptedRequestID,
+                    kind: .interrupted,
+                    retryAvailable: false,
+                    claimed: true
                 )
                 self.status = .failed
             }
@@ -540,10 +675,6 @@ final class AppModel: ObservableObject {
     }
 
     private func process(fileURL: URL, requestID: String) async {
-        defer {
-            try? FileManager.default.removeItem(at: fileURL)
-        }
-
         do {
             var tokens = try await authManager.validTokens()
             var client = makeClient(tokens)
@@ -557,44 +688,122 @@ final class AppModel: ObservableObject {
                 raw = try await client.transcribe(fileURL: fileURL)
             }
 
-            guard !Task.isCancelled, activeRequestID == requestID else { return }
+            guard !Task.isCancelled,
+                  activeRequestID == requestID else {
+                return
+            }
 
             lastTranscript = raw
             bridgeStatus = .polishing
+            bridgeFailureKind = nil
+            bridgeRetryAvailable = false
             status = .polishing
             markBridgeChanged()
 
             let finalText: String
             do {
                 finalText = try await client.cleanup(raw)
-            } catch let error as ChatGPTClientError where error.isUnauthorized {
-                tokens = try await authManager.validTokens(forceRefresh: true)
-                client = makeClient(tokens)
-                finalText = try await client.cleanup(raw)
             } catch {
+                guard !Task.isCancelled,
+                      activeRequestID == requestID else {
+                    return
+                }
+
+                // Cleanup is optional. Recognition already succeeded, so do not
+                // strand the user in an error state if style cleanup fails.
                 finalText = raw
                 lastError = "Cleanup failed; raw transcript will be inserted. \(error.localizedDescription)"
             }
 
-            guard !Task.isCancelled, activeRequestID == requestID else { return }
+            guard !Task.isCancelled,
+                  activeRequestID == requestID else {
+                return
+            }
 
             responseText = finalText
             resultCreatedAt = Date()
             bridgeError = nil
+            bridgeFailureKind = nil
+            bridgeRetryAvailable = false
+            bridgeRequestClaimed = true
             bridgeStatus = .completed
             status = isServiceReady ? .ready : .idle
             lastTranscript = finalText
             refreshAuthState()
+            deletePreservedAudio(ifMatches: requestID)
             markBridgeChanged()
+        } catch is CancellationError {
+            return
         } catch {
+            guard !Task.isCancelled,
+                  activeRequestID == requestID else {
+                return
+            }
+
             if error is ChatGPTAuthError {
                 isChatGPTLoggedIn = false
                 chatGPTAccountSummary = nil
+                publishBridgeError(
+                    error.localizedDescription,
+                    requestID: requestID,
+                    kind: .authRequired,
+                    retryAvailable: false,
+                    claimed: true
+                )
+                status = .failed
+                return
             }
 
-            publishBridgeError(error.localizedDescription, requestID: requestID)
+            let classification = classifyTranscriptionError(error)
+
+            if classification.kind == .transcriptionPermanent {
+                deletePreservedAudio(ifMatches: requestID)
+            }
+
+            publishBridgeError(
+                error.localizedDescription,
+                requestID: requestID,
+                kind: classification.kind,
+                retryAvailable: classification.retryAvailable,
+                claimed: true
+            )
             status = .failed
         }
+    }
+
+    private func classifyTranscriptionError(
+        _ error: Error
+    ) -> (kind: BridgeFailureKind, retryAvailable: Bool) {
+        if let clientError = error as? ChatGPTClientError {
+            switch clientError {
+            case .emptyTranscription, .invalidURL:
+                return (.transcriptionPermanent, false)
+
+            case .server(let statusCode, _):
+                if statusCode == 401 {
+                    return (.authRequired, false)
+                }
+
+                if statusCode == 408
+                    || statusCode == 409
+                    || statusCode == 425
+                    || statusCode == 429
+                    || statusCode >= 500 {
+                    return (.transcriptionRecoverable, true)
+                }
+
+                return (.transcriptionPermanent, false)
+
+            case .invalidResponse, .missingOutputText:
+                return (.transcriptionRecoverable, true)
+            }
+        }
+
+        if error is URLError {
+            return (.transcriptionRecoverable, true)
+        }
+
+        return (.transcriptionRecoverable, true)
     }
 
     private func makeClient(_ tokens: ChatGPTTokens) -> ChatGPTClient {
@@ -608,20 +817,19 @@ final class AppModel: ObservableObject {
     private func acknowledgeResult(requestID: String?) {
         guard requestID == nil || requestID == activeRequestID else { return }
 
-        activeRequestID = nil
-        responseText = nil
-        resultCreatedAt = nil
-        bridgeError = nil
-
-        if bridgeStatus == .completed || bridgeStatus == .error {
-            bridgeStatus = .idle
-        }
-
+        deletePreservedAudio(ifMatches: activeRequestID)
+        resetBridgeToIdle(clearRequest: true)
         status = isServiceReady ? .ready : .idle
         markBridgeChanged()
     }
 
-    private func publishBridgeError(_ message: String, requestID: String? = nil) {
+    private func publishBridgeError(
+        _ message: String,
+        requestID: String? = nil,
+        kind: BridgeFailureKind,
+        retryAvailable: Bool,
+        claimed: Bool
+    ) {
         if let requestID {
             activeRequestID = requestID
         }
@@ -630,8 +838,41 @@ final class AppModel: ObservableObject {
         resultCreatedAt = Date()
         bridgeError = message
         bridgeStatus = .error
+        bridgeFailureKind = kind
+        bridgeRetryAvailable = retryAvailable
+        bridgeRequestClaimed = claimed
         lastError = message
         markBridgeChanged()
+    }
+
+    private func resetBridgeToIdle(clearRequest: Bool) {
+        bridgeStatus = .idle
+        bridgeRequestClaimed = false
+        bridgeFailureKind = nil
+        bridgeRetryAvailable = false
+        responseText = nil
+        resultCreatedAt = nil
+        bridgeError = nil
+
+        if clearRequest {
+            activeRequestID = nil
+        }
+    }
+
+    private func discardPreservedAudio() {
+        if let preservedAudioURL {
+            try? FileManager.default.removeItem(at: preservedAudioURL)
+        }
+        preservedAudioURL = nil
+        preservedAudioRequestID = nil
+    }
+
+    private func deletePreservedAudio(ifMatches requestID: String?) {
+        guard let requestID,
+              preservedAudioRequestID == requestID else {
+            return
+        }
+        discardPreservedAudio()
     }
 
     private func currentBridgeState() -> BridgeState {
@@ -641,7 +882,10 @@ final class AppModel: ObservableObject {
             serviceReady: isServiceReady,
             backgroundWakeReady: backgroundWakeReady,
             microphoneReady: microphoneCapture.isActive,
+            requestClaimed: bridgeRequestClaimed,
             status: bridgeStatus,
+            failureKind: bridgeFailureKind,
+            retryAvailable: bridgeRetryAvailable,
             requestID: activeRequestID,
             transcribedText: responseText,
             resultCreatedAt: resultCreatedAt,
