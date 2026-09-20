@@ -88,6 +88,9 @@ final class AudioSessionCoordinator {
         }
     }
 
+    /// Both standby and capture deliberately use one persistent AVAudioSession
+    /// profile. The intent still describes lifecycle ownership, but moving from
+    /// standby to capture does NOT change category/mode/options in the background.
     func beginAndWait(_ intent: Intent) async throws {
         activeIntents.insert(intent)
         try await applyHighestIntent()
@@ -98,6 +101,9 @@ final class AudioSessionCoordinator {
         try await applyHighestIntent()
     }
 
+    /// Reserved for a real audio-system interruption/reset. Normal microphone
+    /// retries must not use this because a forced category mutation from the
+    /// background is exactly the transition TypeVoice is trying to avoid.
     func reassertCurrentProfile() async throws {
         sessionIsActive = false
         try await applyHighestIntent(force: true)
@@ -127,32 +133,23 @@ final class AudioSessionCoordinator {
         activeIntents.max(by: { $0.rawValue < $1.rawValue })
     }
 
-    private func profile(
-        for intent: Intent
-    ) -> (
+    /// Configure once while TypeVoice is foregrounded/armed, then keep this
+    /// exact profile active while the service is alive. Microphone privacy is
+    /// controlled by AVAudioEngine/input-tap lifetime, not by changing category.
+    private var persistentProfile: (
         category: AVAudioSession.Category,
         mode: AVAudioSession.Mode,
         options: AVAudioSession.CategoryOptions
     ) {
-        switch intent {
-        case .backgroundKeepAlive:
-            return (
-                .playback,
-                .default,
-                [.mixWithOthers]
-            )
-
-        case .capture:
-            return (
-                .playAndRecord,
-                .default,
-                [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]
-            )
-        }
+        (
+            .playAndRecord,
+            .default,
+            [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]
+        )
     }
 
     private func applyHighestIntent(force: Bool = false) async throws {
-        guard let intent = highestIntent else {
+        guard highestIntent != nil else {
             if sessionIsActive || force {
                 try await performSessionMutation {
                     try AVAudioSession.sharedInstance().setActive(
@@ -165,7 +162,7 @@ final class AudioSessionCoordinator {
             return
         }
 
-        let target = profile(for: intent)
+        let target = persistentProfile
         let session = AVAudioSession.sharedInstance()
 
         let needsReconfiguration =
@@ -186,10 +183,9 @@ final class AudioSessionCoordinator {
                 )
             }
 
-            if intent == .capture {
-                try? session.setAllowHapticsAndSystemSoundsDuringRecording(true)
-            }
-
+            // A long-lived playAndRecord session must not suppress keyboard and
+            // system haptics while the microphone engine itself is idle.
+            try? session.setAllowHapticsAndSystemSoundsDuringRecording(true)
             try session.setActive(true)
         }
 
