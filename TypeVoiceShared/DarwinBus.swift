@@ -7,6 +7,7 @@ enum DarwinEvent: String {
     case heartbeat = "com.miketoryan.typevoice.heartbeat"
     case keyboardVisible = "com.miketoryan.typevoice.keyboardVisible"
     case keyboardHidden = "com.miketoryan.typevoice.keyboardHidden"
+    case activationHandoffBegan = "com.miketoryan.typevoice.activationHandoffBegan"
     case startRecording = "com.miketoryan.typevoice.startRecording"
     case stopRecording = "com.miketoryan.typevoice.stopRecording"
     case cancelRecording = "com.miketoryan.typevoice.cancelRecording"
