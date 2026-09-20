@@ -56,6 +56,7 @@ final class KeyboardViewController: UIInputViewController {
     private var heartbeatTask: Task<Void, Never>?
     private var pollingTask: Task<Void, Never>?
     private var commandTask: Task<Void, Never>?
+    private var startFallbackTask: Task<Void, Never>?
     private var hostResolveTask: Task<Void, Never>?
 
     override func viewDidLoad() {
@@ -82,6 +83,8 @@ final class KeyboardViewController: UIInputViewController {
         mayAutoInsert = false
         insertionScheduledForRequestID = nil
         stopBridgeTasks()
+        startFallbackTask?.cancel()
+        startFallbackTask = nil
         hostResolveTask?.cancel()
         hostResolveTask = nil
         HostApplicationResolver.invalidate()
@@ -94,6 +97,7 @@ final class KeyboardViewController: UIInputViewController {
         heartbeatTask?.cancel()
         pollingTask?.cancel()
         commandTask?.cancel()
+        startFallbackTask?.cancel()
         hostResolveTask?.cancel()
     }
 
@@ -113,13 +117,6 @@ final class KeyboardViewController: UIInputViewController {
             return
         }
 
-        guard latestState.backgroundWakeReady else {
-            let requestID = coldStartRequestID ?? UUID().uuidString
-            coldStartRequestID = requestID
-            openContainingApp(requestID: requestID)
-            return
-        }
-
         switch latestState.status {
         case .recording:
             mayAutoInsert = true
@@ -129,9 +126,41 @@ final class KeyboardViewController: UIInputViewController {
             )
 
         case .starting, .transcribing, .polishing:
-            break
+            // A second tap is always an escape hatch. This makes a stuck
+            // recognition request immediately cancelable from the keyboard.
+            sendCommand(
+                .cancelRecording,
+                requestID: latestState.requestID ?? currentRequestID
+            )
+
+        case .error:
+            switch latestState.failureKind {
+            case .transcriptionRecoverable
+                where latestState.retryAvailable:
+                sendCommand(
+                    .retryProcessing,
+                    requestID: latestState.requestID ?? currentRequestID
+                )
+
+            case .audioStartFailed, .bridgeUnavailable:
+                if let requestID = latestState.requestID ?? currentRequestID {
+                    launchForegroundRecovery(requestID: requestID)
+                } else {
+                    startRecordingRequest()
+                }
+
+            case .authRequired:
+                if let requestID = latestState.requestID ?? currentRequestID {
+                    launchForegroundRecovery(requestID: requestID)
+                }
+
+            default:
+                startRecordingRequest()
+            }
 
         default:
+            // Do not gate this on backgroundWakeReady. The app gets the first
+            // chance to claim the request; foreground launch is a fallback only.
             startRecordingRequest()
         }
     }
@@ -406,12 +435,90 @@ final class KeyboardViewController: UIInputViewController {
                     interfaceLanguage: self.latestState.interfaceLanguage
                 )
                 self.refreshUI()
+            }
+        }
+    }
 
-                if action == .startRecording,
-                   let requestID {
-                    self.launchForegroundRecovery(requestID: requestID)
+    private func sendStartRecordingWithClaimFallback(requestID: String) {
+        commandTask?.cancel()
+        startFallbackTask?.cancel()
+
+        commandTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            do {
+                let state = try await self.bridge.send(
+                    .startRecording,
+                    requestID: requestID,
+                    timeoutInterval: 1.0
+                )
+                self.apply(state)
+
+                if state.requestID == requestID,
+                   state.requestClaimed {
+                    return
+                }
+            } catch {
+                // Do not foreground immediately. The containing app may have
+                // received and claimed the request even if this HTTP response
+                // was lost or delayed.
+            }
+
+            self.startClaimFallbackWindow(requestID: requestID)
+        }
+    }
+
+    private func startClaimFallbackWindow(requestID: String) {
+        startFallbackTask?.cancel()
+
+        startFallbackTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            let deadline = Date().addingTimeInterval(1.5)
+
+            while !Task.isCancelled,
+                  Date() < deadline,
+                  self.keyboardVisible,
+                  self.currentRequestID == requestID {
+                if self.latestState.requestID == requestID,
+                   self.latestState.requestClaimed {
+                    return
+                }
+
+                do {
+                    let state = try await self.bridge.fetchState(
+                        timeoutInterval: 0.25
+                    )
+                    self.apply(state)
+
+                    if state.requestID == requestID,
+                       state.requestClaimed {
+                        return
+                    }
+                } catch {
+                    // Keep the short claim window open. A single missed local
+                    // request is not enough evidence to disrupt the user.
+                }
+
+                do {
+                    try await Task.sleep(for: .milliseconds(120))
+                } catch {
+                    return
                 }
             }
+
+            guard !Task.isCancelled,
+                  self.keyboardVisible,
+                  self.currentRequestID == requestID else {
+                return
+            }
+
+            if self.latestState.requestID == requestID,
+               self.latestState.requestClaimed {
+                return
+            }
+
+            self.launchForegroundRecovery(requestID: requestID)
         }
     }
 
@@ -427,7 +534,10 @@ final class KeyboardViewController: UIInputViewController {
             serviceReady: true,
             backgroundWakeReady: latestState.backgroundWakeReady,
             microphoneReady: latestState.microphoneReady,
+            requestClaimed: false,
             status: .starting,
+            failureKind: nil,
+            retryAvailable: false,
             requestID: requestID,
             transcribedText: nil,
             resultCreatedAt: nil,
@@ -436,7 +546,7 @@ final class KeyboardViewController: UIInputViewController {
         )
 
         refreshUI()
-        sendCommand(.startRecording, requestID: requestID)
+        sendStartRecordingWithClaimFallback(requestID: requestID)
     }
 
     private func apply(_ state: BridgeState) {
@@ -461,6 +571,13 @@ final class KeyboardViewController: UIInputViewController {
 
         refreshUI()
 
+        if state.requestClaimed,
+           let requestID = state.requestID,
+           requestID == currentRequestID {
+            startFallbackTask?.cancel()
+            startFallbackTask = nil
+        }
+
         if state.status == .recording,
            let requestID = state.requestID,
            requestID == foregroundRecoveryRequestID {
@@ -469,9 +586,18 @@ final class KeyboardViewController: UIInputViewController {
 
         if state.status == .error,
            let requestID = state.requestID,
-           requestID == currentRequestID {
+           requestID == currentRequestID,
+           state.failureKind == .audioStartFailed
+            || state.failureKind == .bridgeUnavailable {
             launchForegroundRecovery(requestID: requestID)
             return
+        }
+
+        if state.status == .idle,
+           state.requestID == nil {
+            currentRequestID = nil
+            mayAutoInsert = false
+            insertionScheduledForRequestID = nil
         }
 
         if state.status == .completed,
@@ -512,7 +638,7 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func refreshUI() {
-        let isColdState = hasFullAccess && !latestState.backgroundWakeReady
+        let isColdState = hasFullAccess && !latestState.serviceReady
         let hasReturnTarget = hostBundleID != nil
         let shouldUseColdStartLink = isColdState && hasReturnTarget
 
@@ -558,7 +684,7 @@ final class KeyboardViewController: UIInputViewController {
             return
         }
 
-        guard latestState.backgroundWakeReady else {
+        guard latestState.serviceReady else {
             if hostBundleID == nil {
                 statusLabel.text = localized(
                     "正在识别当前输入应用…",
@@ -589,10 +715,15 @@ final class KeyboardViewController: UIInputViewController {
 
         switch latestState.status {
         case .idle:
-            statusLabel.text = localized(
-                "后台已待命 · 点击后启动麦克风",
-                "Ready in background · tap to start the microphone"
-            )
+            statusLabel.text = latestState.backgroundWakeReady
+                ? localized(
+                    "后台已待命 · 点击后启动麦克风",
+                    "Ready in background · tap to start the microphone"
+                )
+                : localized(
+                    "后台服务在线 · 点击后直接尝试启动麦克风",
+                    "Background service online · tap to start the microphone"
+                )
             micButton.setTitle(
                 localized("🎙 开始语音", "🎙 Speak"),
                 for: .normal
@@ -600,15 +731,20 @@ final class KeyboardViewController: UIInputViewController {
             micButton.backgroundColor = .systemBlue.withAlphaComponent(0.14)
 
         case .starting:
-            statusLabel.text = localized(
-                "正在连接录音服务…",
-                "Connecting to recorder…"
-            )
+            statusLabel.text = latestState.requestClaimed
+                ? localized(
+                    "TypeVoice 已接单 · 正在启动麦克风",
+                    "TypeVoice claimed the request · starting microphone"
+                )
+                : localized(
+                    "正在联系后台 TypeVoice…",
+                    "Contacting TypeVoice in the background…"
+                )
             micButton.setTitle(
-                localized("正在启动…", "Starting…"),
+                localized("■ 取消启动", "■ Cancel"),
                 for: .normal
             )
-            micButton.backgroundColor = .systemGray.withAlphaComponent(0.18)
+            micButton.backgroundColor = .systemOrange.withAlphaComponent(0.18)
 
         case .recording:
             statusLabel.text = localized(
@@ -623,25 +759,25 @@ final class KeyboardViewController: UIInputViewController {
 
         case .transcribing:
             statusLabel.text = localized(
-                "正在识别…",
-                "Transcribing…"
+                "正在识别 · 点击可立即终止",
+                "Transcribing · tap to cancel immediately"
             )
             micButton.setTitle(
-                localized("识别中…", "Transcribing…"),
+                localized("■ 终止识别", "■ Cancel Transcription"),
                 for: .normal
             )
-            micButton.backgroundColor = .systemGray.withAlphaComponent(0.18)
+            micButton.backgroundColor = .systemOrange.withAlphaComponent(0.18)
 
         case .polishing:
             statusLabel.text = localized(
-                "正在整理表达…",
-                "Cleaning up…"
+                "正在整理表达 · 点击可立即终止",
+                "Cleaning up · tap to cancel immediately"
             )
             micButton.setTitle(
-                localized("整理中…", "Cleaning…"),
+                localized("■ 终止处理", "■ Cancel Processing"),
                 for: .normal
             )
-            micButton.backgroundColor = .systemGray.withAlphaComponent(0.18)
+            micButton.backgroundColor = .systemOrange.withAlphaComponent(0.18)
 
         case .completed:
             break
@@ -651,10 +787,33 @@ final class KeyboardViewController: UIInputViewController {
                 "语音处理失败",
                 "Dictation failed"
             )
-            micButton.setTitle(
-                localized("🎙 再试一次", "🎙 Try Again"),
-                for: .normal
-            )
+
+            switch latestState.failureKind {
+            case .transcriptionRecoverable where latestState.retryAvailable:
+                micButton.setTitle(
+                    localized("↻ 重试识别", "↻ Retry Transcription"),
+                    for: .normal
+                )
+
+            case .authRequired:
+                micButton.setTitle(
+                    localized("打开 TypeVoice 登录", "Open TypeVoice to Sign In"),
+                    for: .normal
+                )
+
+            case .audioStartFailed, .bridgeUnavailable:
+                micButton.setTitle(
+                    localized("打开 TypeVoice 恢复", "Open TypeVoice to Recover"),
+                    for: .normal
+                )
+
+            default:
+                micButton.setTitle(
+                    localized("🎙 重新输入", "🎙 Record Again"),
+                    for: .normal
+                )
+            }
+
             micButton.backgroundColor = .systemOrange.withAlphaComponent(0.18)
         }
 
@@ -819,7 +978,10 @@ final class KeyboardViewController: UIInputViewController {
                     serviceReady: self.latestState.serviceReady,
                     backgroundWakeReady: self.latestState.backgroundWakeReady,
                     microphoneReady: self.latestState.microphoneReady,
+                    requestClaimed: false,
                     status: .idle,
+                    failureKind: nil,
+                    retryAvailable: false,
                     requestID: nil,
                     transcribedText: nil,
                     resultCreatedAt: nil,
