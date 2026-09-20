@@ -72,6 +72,7 @@ final class KeyboardViewController: UIInputViewController {
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         keyboardVisible = true
+        DarwinBus.post(.keyboardVisible)
         hostBundleID = HostApplicationResolver.lastCaptured
         coldStartRequestID = hostBundleID == nil ? nil : UUID().uuidString
         startDarwinStateObservers()
@@ -84,6 +85,9 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     override func viewWillDisappear(_ animated: Bool) {
+        if keyboardVisible {
+            DarwinBus.post(.keyboardHidden)
+        }
         keyboardVisible = false
         mayAutoInsert = false
         insertionScheduledForRequestID = nil
@@ -100,6 +104,9 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     deinit {
+        if keyboardVisible {
+            DarwinBus.post(.keyboardHidden)
+        }
         heartbeatTask?.cancel()
         pollingTask?.cancel()
         commandTask?.cancel()
@@ -176,6 +183,9 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     @objc private func globeTapped() {
+        if keyboardVisible {
+            DarwinBus.post(.keyboardHidden)
+        }
         keyboardVisible = false
         mayAutoInsert = false
         insertionScheduledForRequestID = nil
