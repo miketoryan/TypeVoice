@@ -710,7 +710,6 @@ final class AppModel: ObservableObject {
         default:
             break
         }
-        }
     }
 
     private func handleBridgeRequest(_ request: BridgeRequest) async -> BridgeState {
