@@ -51,6 +51,7 @@ final class AppModel: ObservableObject {
     private var pendingKeyboardActivation: PendingKeyboardActivation?
     private var keyboardIsVisible = false
     private var keyboardHasBeenSeen = false
+    private var keyboardExitedAt: Date?
     private var darwinObservations: [DarwinObservation] = []
 
     init() {
@@ -232,6 +233,7 @@ final class AppModel: ObservableObject {
             isQuickDictationEnabled = true
             SharedStore.quickDictationEnabled = true
             isServiceReady = true
+            keyboardExitedAt = nil
             status = .ready
             resetBridgeToIdle(clearRequest: true)
             bridgeAudioStage = .standbySessionReady
@@ -273,6 +275,7 @@ final class AppModel: ObservableObject {
         isQuickDictationEnabled = false
         SharedStore.quickDictationEnabled = false
         isServiceReady = false
+        keyboardExitedAt = nil
         status = .idle
         resetBridgeToIdle(clearRequest: true)
         markBridgeChanged()
@@ -557,6 +560,14 @@ final class AppModel: ObservableObject {
     func appBecameActive() {
         refreshAuthState()
 
+        // Foreground TypeVoice itself is not standby. Any previous keyboard-exit
+        // deadline is superseded; a new deadline will be created when the app
+        // backgrounds again or the keyboard is actually hidden.
+        if isServiceReady {
+            keyboardExitedAt = nil
+            microphoneCapture.clearStandbyExpiry()
+        }
+
         if pendingKeyboardActivation != nil {
             resolvePendingKeyboardActivationIfPossible()
             return
@@ -588,19 +599,16 @@ final class AppModel: ObservableObject {
     }
 
     /// Called when the user changes 10 s / 30 s / 1 min / 5 min in Settings.
-    /// The selected duration is defined as time AFTER leaving the TypeVoice
-    /// keyboard. While the keyboard remains visible, no user-facing standby
-    /// countdown is allowed to expire.
+    /// The duration is always measured from the actual keyboard-exit timestamp,
+    /// not from when this setting changes.
     func updateStandbyDuration() {
-        guard isServiceReady,
-              !microphoneCapture.isRecording else {
-            return
-        }
+        guard isServiceReady else { return }
 
         if keyboardIsVisible {
+            keyboardExitedAt = nil
             microphoneCapture.clearStandbyExpiry()
-        } else if keyboardHasBeenSeen {
-            scheduleStandbyExpiry()
+        } else if keyboardHasBeenSeen || keyboardExitedAt != nil {
+            applyKeyboardExitDeadline()
         } else {
             microphoneCapture.clearStandbyExpiry()
         }
@@ -611,15 +619,45 @@ final class AppModel: ObservableObject {
         return microphoneCapture.isWarmReady
     }
 
-    private func scheduleStandbyExpiry() {
-        guard isServiceReady,
-              !microphoneCapture.isRecording else {
+    /// Applies the exact selected deadline from the moment the keyboard left.
+    /// If a recording is still active, keep the timestamp but defer teardown;
+    /// stop/cancel will call this again and use the remaining time.
+    private func applyKeyboardExitDeadline() {
+        guard isServiceReady else { return }
+
+        guard !keyboardIsVisible,
+              let keyboardExitedAt else {
+            microphoneCapture.clearStandbyExpiry()
             return
         }
 
-        microphoneCapture.setStandbyExpiry(
-            after: max(10, SharedStore.quickStandbySeconds)
-        )
+        if microphoneCapture.isRecording {
+            microphoneCapture.clearStandbyExpiry()
+            return
+        }
+
+        let selected = TimeInterval(max(10, SharedStore.quickStandbySeconds))
+        let elapsed = Date().timeIntervalSince(keyboardExitedAt)
+        let remaining = selected - elapsed
+
+        guard remaining > 0 else {
+            expireWarmStandby()
+            return
+        }
+
+        microphoneCapture.setStandbyExpiry(after: remaining)
+    }
+
+    /// Called when the containing app itself leaves the foreground without a
+    /// visible TypeVoice keyboard. This prevents a manually warmed session from
+    /// staying hot forever merely because no keyboardHidden event occurred.
+    func appEnteredBackground() {
+        guard isServiceReady, !keyboardIsVisible else { return }
+
+        if keyboardExitedAt == nil {
+            keyboardExitedAt = Date()
+        }
+        applyKeyboardExitDeadline()
     }
 
     /// Releases only the warm audio resources. Ongoing transcription/result
@@ -701,6 +739,7 @@ final class AppModel: ObservableObject {
         case .keyboardVisible:
             keyboardIsVisible = true
             keyboardHasBeenSeen = true
+            keyboardExitedAt = nil
 
             // While the TypeVoice keyboard is visible there is no standby
             // countdown. The selected 10s/30s/1m/5m window starts only when the
@@ -718,7 +757,8 @@ final class AppModel: ObservableObject {
         case .keyboardHidden:
             keyboardIsVisible = false
             keyboardHasBeenSeen = true
-            scheduleStandbyExpiry()
+            keyboardExitedAt = Date()
+            applyKeyboardExitDeadline()
             DarwinBus.post(.serviceChanged)
 
         default:
@@ -861,6 +901,8 @@ final class AppModel: ObservableObject {
                 try? await audioSessionCoordinator.endAndWait(.capture)
                 if keyboardIsVisible {
                     microphoneCapture.clearStandbyExpiry()
+                } else {
+                    applyKeyboardExitDeadline()
                 }
                 return false
             }
@@ -880,8 +922,12 @@ final class AppModel: ObservableObject {
         } catch {
             microphoneCapture.discardRecording()
             try? await audioSessionCoordinator.endAndWait(.capture)
-            if backgroundWakeReady, keyboardIsVisible {
-                microphoneCapture.clearStandbyExpiry()
+            if backgroundWakeReady {
+                if keyboardIsVisible {
+                    microphoneCapture.clearStandbyExpiry()
+                } else {
+                    applyKeyboardExitDeadline()
+                }
             }
 
             guard activeRequestID == requestID else { return false }
@@ -926,6 +972,8 @@ final class AppModel: ObservableObject {
         try? await audioSessionCoordinator.endAndWait(.capture)
         if keyboardIsVisible {
             microphoneCapture.clearStandbyExpiry()
+        } else {
+            applyKeyboardExitDeadline()
         }
 
         discardPreservedAudio()
@@ -995,8 +1043,12 @@ final class AppModel: ObservableObject {
             try? await audioSessionCoordinator.endAndWait(.capture)
         }
 
-        if backgroundWakeReady, keyboardIsVisible {
-            microphoneCapture.clearStandbyExpiry()
+        if backgroundWakeReady {
+            if keyboardIsVisible {
+                microphoneCapture.clearStandbyExpiry()
+            } else {
+                applyKeyboardExitDeadline()
+            }
         }
 
         discardPreservedAudio()
