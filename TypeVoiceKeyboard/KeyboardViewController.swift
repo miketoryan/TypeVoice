@@ -22,6 +22,8 @@ final class KeyboardViewController: UIInputViewController {
     private var coldStartRequestID: String?
     private var foregroundHandoffPending = false
     private var lastBridgeSuccessAt: Date?
+    private var initialBridgeCheckFinished = false
+    private var isResolvingHostApplication = false
     private var darwinObservations: [DarwinObservation] = []
 
     private let readinessLeaseSeconds: TimeInterval = 3
@@ -40,11 +42,15 @@ final class KeyboardViewController: UIInputViewController {
         super.viewWillAppear(animated)
         keyboardVisible = true
         foregroundHandoffPending = false
-        DarwinBus.post(.keyboardVisible)
+        initialBridgeCheckFinished = false
         hostBundleID = HostApplicationResolver.lastCaptured
         coldStartRequestID = hostBundleID == nil ? nil : UUID().uuidString
+        isResolvingHostApplication = hostBundleID == nil
+
+        DarwinBus.post(.keyboardVisible)
         startDarwinStateObservers()
         startBridgeTasks()
+        refreshUI()
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -63,9 +69,13 @@ final class KeyboardViewController: UIInputViewController {
         darwinObservations.removeAll()
         hostResolveTask?.cancel()
         hostResolveTask = nil
-        HostApplicationResolver.invalidate()
-        hostBundleID = nil
-        coldStartRequestID = nil
+        if !foregroundHandoffPending {
+            HostApplicationResolver.invalidate()
+            hostBundleID = nil
+            coldStartRequestID = nil
+        }
+        initialBridgeCheckFinished = false
+        isResolvingHostApplication = false
         super.viewWillDisappear(animated)
     }
 
@@ -85,6 +95,49 @@ final class KeyboardViewController: UIInputViewController {
                 "请在系统设置里开启“允许完全访问”",
                 "Enable Allow Full Access in Settings"
             )
+            return
+        }
+
+        if !initialBridgeCheckFinished {
+            coldStartHost?.view.isHidden = true
+            micButton.isHidden = false
+            micButton.isUserInteractionEnabled = false
+            statusLabel.text = localized(
+                "正在确认 TypeVoice 状态…",
+                "Checking TypeVoice status…"
+            )
+            micButton.setTitle(
+                localized("正在准备…", "Preparing…"),
+                for: .normal
+            )
+            micButton.backgroundColor = .systemGray.withAlphaComponent(0.16)
+            return
+        }
+
+        let coldMicrophoneNeedsHost =
+            (!latestState.serviceReady || !latestState.backgroundWakeReady)
+            && hostBundleID == nil
+
+        if coldMicrophoneNeedsHost {
+            coldStartHost?.view.isHidden = true
+            micButton.isHidden = false
+            micButton.isUserInteractionEnabled = false
+            statusLabel.text = isResolvingHostApplication
+                ? localized(
+                    "麦克风为冷状态 · 正在识别当前输入应用…",
+                    "Microphone is cold · identifying the current app…"
+                )
+                : localized(
+                    "无法确认当前输入应用 · 请切换一次键盘后重试",
+                    "Could not identify the current app · switch keyboards once and try again"
+                )
+            micButton.setTitle(
+                isResolvingHostApplication
+                    ? localized("正在准备…", "Preparing…")
+                    : localized("暂不可用", "Unavailable"),
+                for: .normal
+            )
+            micButton.backgroundColor = .systemGray.withAlphaComponent(0.16)
             return
         }
 
@@ -140,8 +193,16 @@ final class KeyboardViewController: UIInputViewController {
             }
 
         default:
-            // Do not gate this on backgroundWakeReady. The app gets the first
-            // chance to claim the request; foreground launch is a fallback only.
+            guard initialBridgeCheckFinished,
+                  latestState.serviceReady,
+                  latestState.backgroundWakeReady else {
+                if hostBundleID == nil {
+                    resolveHostApplicationWithRetries()
+                }
+                refreshUI()
+                return
+            }
+
             startRecordingRequest()
         }
     }
@@ -253,6 +314,8 @@ final class KeyboardViewController: UIInputViewController {
 
     private func resolveHostApplicationWithRetries() {
         hostResolveTask?.cancel()
+        isResolvingHostApplication = hostBundleID == nil
+        refreshUI()
 
         hostResolveTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -264,6 +327,7 @@ final class KeyboardViewController: UIInputViewController {
                 if self.coldStartRequestID == nil {
                     self.coldStartRequestID = UUID().uuidString
                 }
+                self.isResolvingHostApplication = false
                 self.refreshUI()
             }
 
@@ -280,6 +344,7 @@ final class KeyboardViewController: UIInputViewController {
                     if self.coldStartRequestID == nil {
                         self.coldStartRequestID = UUID().uuidString
                     }
+                    self.isResolvingHostApplication = false
                     self.refreshUI()
                     return
                 }
@@ -296,6 +361,7 @@ final class KeyboardViewController: UIInputViewController {
             // return. Leave the mic disabled and explain the state instead.
             self.hostBundleID = nil
             self.coldStartRequestID = nil
+            self.isResolvingHostApplication = false
             self.refreshUI()
         }
     }
@@ -375,7 +441,10 @@ final class KeyboardViewController: UIInputViewController {
         pollingTask = Task { @MainActor [weak self] in
             guard let self else { return }
 
-            await self.fetchState()
+            await self.fetchState(
+                timeoutInterval: 0.45,
+                marksInitialCheck: true
+            )
 
             while !Task.isCancelled {
                 do {
@@ -383,7 +452,7 @@ final class KeyboardViewController: UIInputViewController {
                 } catch {
                     return
                 }
-                await self.fetchState()
+                await self.fetchState(timeoutInterval: 0.8)
             }
         }
     }
@@ -393,14 +462,26 @@ final class KeyboardViewController: UIInputViewController {
         pollingTask = nil
     }
 
-    private func fetchState() async {
+    private func fetchState(
+        timeoutInterval: TimeInterval = 0.8,
+        marksInitialCheck: Bool = false
+    ) async {
         guard keyboardVisible else { return }
 
         do {
-            let state = try await bridge.fetchState()
+            let state = try await bridge.fetchState(
+                timeoutInterval: timeoutInterval
+            )
+            if marksInitialCheck {
+                initialBridgeCheckFinished = true
+            }
             apply(state)
         } catch {
+            if marksInitialCheck {
+                initialBridgeCheckFinished = true
+            }
             applyConnectionFailure()
+            refreshUI()
         }
     }
 
@@ -435,6 +516,13 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func startRecordingRequest() {
+        guard initialBridgeCheckFinished,
+              latestState.serviceReady,
+              latestState.backgroundWakeReady else {
+            refreshUI()
+            return
+        }
+
         let requestID = UUID().uuidString
         currentRequestID = requestID
         mayAutoInsert = true
@@ -443,7 +531,7 @@ final class KeyboardViewController: UIInputViewController {
         latestState = BridgeState(
             serverID: latestState.serverID,
             revision: latestState.revision &+ 1,
-            serviceReady: true,
+            serviceReady: latestState.serviceReady,
             quickDictationEnabled: latestState.quickDictationEnabled,
             backgroundWakeReady: latestState.backgroundWakeReady,
             microphoneReady: latestState.microphoneReady,
@@ -518,10 +606,13 @@ final class KeyboardViewController: UIInputViewController {
 
         guard latestState.status != .recording,
               latestState.status != .transcribing,
-              latestState.status != .polishing,
-              latestState.status != .starting else {
+              latestState.status != .polishing else {
             return
         }
+
+        currentRequestID = nil
+        mayAutoInsert = false
+        insertionScheduledForRequestID = nil
 
         latestState = .unavailable(
             localized(
