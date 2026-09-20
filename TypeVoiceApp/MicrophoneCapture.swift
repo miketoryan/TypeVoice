@@ -11,6 +11,10 @@ final class MicrophoneCapture {
     private var tapInstalled = false
     private var receivedWarmBuffer = false
     private var receivedRecordingBuffer = false
+    private var standbyExpiryTimestamp: TimeInterval = 0
+
+    /// Fired on the main queue when the warm-idle window expires.
+    var onStandbyExpired: (() -> Void)?
 
     /// True only while one dictation is being written to disk.
     var isActive: Bool {
@@ -117,6 +121,25 @@ final class MicrophoneCapture {
         }
     }
 
+    /// Arms or refreshes the idle warm-microphone deadline. The deadline is
+    /// checked from the audio render callback itself rather than a background
+    /// Timer/Task, so the 10 s / 30 s / 1 min / 5 min window remains reliable
+    /// while the app is backgrounded.
+    func setStandbyExpiry(after seconds: Int) {
+        lock.lock()
+        if recordingFile == nil {
+            standbyExpiryTimestamp = Date().timeIntervalSince1970
+                + TimeInterval(max(10, seconds))
+        }
+        lock.unlock()
+    }
+
+    func clearStandbyExpiry() {
+        lock.lock()
+        standbyExpiryTimestamp = 0
+        lock.unlock()
+    }
+
     /// Opens only the file gate on the already-running input engine.
     /// No AudioSession activation, tap install, graph rebuild or engine.start()
     /// occurs on the warm/background path.
@@ -153,6 +176,7 @@ final class MicrophoneCapture {
         recordingURL = url
         recordingFile = file
         receivedRecordingBuffer = false
+        standbyExpiryTimestamp = 0
         lock.unlock()
 
         let startedAt = ContinuousClock.now
@@ -200,6 +224,7 @@ final class MicrophoneCapture {
         recordingURL = nil
         receivedWarmBuffer = false
         receivedRecordingBuffer = false
+        standbyExpiryTimestamp = 0
         lock.unlock()
 
         if let engine {
@@ -235,16 +260,29 @@ final class MicrophoneCapture {
     }
 
     private func consume(_ buffer: AVAudioPCMBuffer) {
+        let now = Date().timeIntervalSince1970
+        var shouldExpire = false
+
         lock.lock()
         receivedWarmBuffer = true
 
         if let file = recordingFile {
             receivedRecordingBuffer = true
             try? file.write(from: buffer)
+        } else if standbyExpiryTimestamp > 0,
+                  now >= standbyExpiryTimestamp {
+            standbyExpiryTimestamp = 0
+            shouldExpire = true
         }
         // When recordingFile == nil, the warm tap deliberately discards the
         // buffer. Keeping the tap alive is what preserves background mic IO.
         lock.unlock()
+
+        if shouldExpire {
+            DispatchQueue.main.async { [weak self] in
+                self?.onStandbyExpired?()
+            }
+        }
     }
 }
 
