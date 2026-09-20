@@ -52,6 +52,7 @@ final class KeyboardViewController: UIInputViewController {
     private var hostBundleID: String?
     private var coldStartRequestID: String?
     private var foregroundRecoveryRequestID: String?
+    private var foregroundHandoffPending = false
     private var lastBridgeSuccessAt: Date?
     private var darwinObservations: [DarwinObservation] = []
 
@@ -72,6 +73,7 @@ final class KeyboardViewController: UIInputViewController {
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         keyboardVisible = true
+        foregroundHandoffPending = false
         DarwinBus.post(.keyboardVisible)
         hostBundleID = HostApplicationResolver.lastCaptured
         coldStartRequestID = hostBundleID == nil ? nil : UUID().uuidString
@@ -85,7 +87,7 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     override func viewWillDisappear(_ animated: Bool) {
-        if keyboardVisible {
+        if keyboardVisible && !foregroundHandoffPending {
             DarwinBus.post(.keyboardHidden)
         }
         keyboardVisible = false
@@ -104,7 +106,7 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     deinit {
-        if keyboardVisible {
+        if keyboardVisible && !foregroundHandoffPending {
             DarwinBus.post(.keyboardHidden)
         }
         heartbeatTask?.cancel()
@@ -267,8 +269,8 @@ final class KeyboardViewController: UIInputViewController {
                 hostBundleID: hostBundleID,
                 requestID: coldStartRequestID ?? UUID().uuidString,
                 mode: .speak,
-                onActivate: {
-                    DarwinBus.post(.activationHandoffBegan)
+                onActivate: { [weak self] in
+                    self?.beginForegroundHandoff()
                 }
             )
         )
@@ -767,8 +769,8 @@ final class KeyboardViewController: UIInputViewController {
             hostBundleID: hostBundleID,
             requestID: launchRequestID ?? "pending",
             mode: hasRecoverableAudioError ? .recover : .speak,
-            onActivate: {
-                DarwinBus.post(.activationHandoffBegan)
+            onActivate: { [weak self] in
+                self?.beginForegroundHandoff()
             }
         )
         coldStartHost?.view.isHidden = !shouldShowForegroundLink
@@ -920,6 +922,11 @@ final class KeyboardViewController: UIInputViewController {
         spaceButton.setTitle(localized("空格", "Space"), for: .normal)
     }
 
+    private func beginForegroundHandoff() {
+        foregroundHandoffPending = true
+        DarwinBus.post(.activationHandoffBegan)
+    }
+
     private func launchForegroundRecovery(requestID: String) {
         guard foregroundRecoveryRequestID != requestID else { return }
         foregroundRecoveryRequestID = requestID
@@ -1014,10 +1021,9 @@ final class KeyboardViewController: UIInputViewController {
             "Background recovery failed. Opening TypeVoice to activate the microphone…"
         )
 
-        // Mark this disappearance as a temporary activation handoff before the
-        // keyboard leaves the screen. AppModel will ignore the corresponding
-        // keyboardHidden event for standby timing.
-        DarwinBus.post(.activationHandoffBegan)
+        // Mark this disappearance locally BEFORE opening TypeVoice. This avoids
+        // relying on cross-process Darwin notification ordering.
+        beginForegroundHandoff()
 
         // Prefer the same SwiftUI openURL handoff pattern already proven in
         // VoiceKing. This is only a recovery fallback; the normal TypeVoice
