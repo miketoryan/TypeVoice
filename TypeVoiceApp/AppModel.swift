@@ -13,7 +13,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var isLoggingIn = false
     @Published private(set) var chatGPTAccountSummary: String?
 
-    private let audioService = AudioStandbyService()
+    private let audioSessionCoordinator = AudioSessionCoordinator()
+    private let backgroundAnchor = BackgroundExecutionAnchor()
+    private let microphoneCapture = MicrophoneCapture()
     private let authManager = ChatGPTAuthManager()
     private let localBridge = LocalBridgeServer()
     private let serverID = UUID().uuidString
@@ -27,29 +29,31 @@ final class AppModel: ObservableObject {
 
     private var processingTask: Task<Void, Never>?
     private var loginTask: Task<Void, Never>?
-    private var audioActivationTask: Task<Bool, Never>?
+    private var recordingStartTask: Task<Bool, Never>?
+    private var backgroundRestoreTask: Task<Bool, Never>?
 
     init() {
-        audioService.onExpired = { [weak self] in
+        audioSessionCoordinator.onInterruptionBegan = { [weak self] in
+            self?.audioInterruptionBegan()
+        }
+
+        audioSessionCoordinator.onInterruptionEnded = { [weak self] in
+            guard let self else { return }
             Task { @MainActor in
-                self?.disarm()
+                _ = await self.restoreBackgroundExecution()
             }
         }
 
-        audioService.onInterrupted = { [weak self] in
+        audioSessionCoordinator.onMediaServicesReset = { [weak self] in
+            guard let self else { return }
             Task { @MainActor in
-                guard let self else { return }
-                self.audioActivationTask?.cancel()
-                self.audioActivationTask = nil
-                self.audioService.cancelRecording(keepWarm: false)
-
-                // Keep the local service logically available. The keyboard can
-                // now distinguish "service alive" from "microphone unavailable"
-                // and attempt a background microphone recovery before falling
-                // back to the existing foreground cold-start path.
-                self.publishBridgeError("Microphone session was interrupted.")
-                self.status = .failed
+                self.microphoneCapture.stopAndDiscard()
+                _ = await self.restoreBackgroundExecution(forceReassert: true)
             }
+        }
+
+        audioSessionCoordinator.onRouteChanged = { [weak self] in
+            self?.markBridgeChanged()
         }
 
         do {
@@ -69,7 +73,8 @@ final class AppModel: ObservableObject {
     deinit {
         processingTask?.cancel()
         loginTask?.cancel()
-        audioActivationTask?.cancel()
+        recordingStartTask?.cancel()
+        backgroundRestoreTask?.cancel()
         localBridge.stop()
     }
 
@@ -117,6 +122,11 @@ final class AppModel: ObservableObject {
         lastError = nil
     }
 
+    /// Arms Typeless-style background readiness.
+    ///
+    /// The microphone remains fully off here. The silent playback anchor is what
+    /// keeps the containing app executable so a later keyboard command can start
+    /// the microphone on demand without opening TypeVoice.
     func arm() async {
         guard authManager.isLoggedIn else {
             refreshAuthState()
@@ -134,7 +144,7 @@ final class AppModel: ObservableObject {
             return
         }
 
-        let granted = await audioService.requestMicrophonePermission()
+        let granted = await microphoneCapture.requestPermission()
         guard granted else {
             lastError = "Microphone permission is required."
             status = .failed
@@ -142,7 +152,8 @@ final class AppModel: ObservableObject {
         }
 
         do {
-            try await activateMicrophoneWithRetry()
+            try await audioSessionCoordinator.beginAndWait(.backgroundKeepAlive)
+            try backgroundAnchor.start()
 
             isServiceReady = true
             status = .ready
@@ -154,6 +165,8 @@ final class AppModel: ObservableObject {
             lastError = nil
             markBridgeChanged()
         } catch {
+            backgroundAnchor.stop()
+            audioSessionCoordinator.reset()
             publishBridgeError(error.localizedDescription)
             status = .failed
         }
@@ -162,10 +175,14 @@ final class AppModel: ObservableObject {
     func disarm() {
         processingTask?.cancel()
         processingTask = nil
-        audioActivationTask?.cancel()
-        audioActivationTask = nil
+        recordingStartTask?.cancel()
+        recordingStartTask = nil
+        backgroundRestoreTask?.cancel()
+        backgroundRestoreTask = nil
 
-        audioService.cancelRecording(keepWarm: false)
+        microphoneCapture.stopAndDiscard()
+        backgroundAnchor.stop()
+        audioSessionCoordinator.reset()
 
         isServiceReady = false
         status = .idle
@@ -200,30 +217,34 @@ final class AppModel: ObservableObject {
         let cameFromKeyboard = source == "keyboard"
 
         Task {
-            if !isServiceReady || !audioService.isRunning {
+            if !isServiceReady {
                 await arm()
+            } else if !backgroundWakeReady {
+                _ = await restoreBackgroundExecution(forceReassert: true)
             }
 
-            guard cameFromKeyboard, isServiceReady, audioService.isRunning else {
+            guard cameFromKeyboard, isServiceReady else {
                 return
             }
 
             if shouldAutoStart,
                let requestedRecordingID,
                !requestedRecordingID.isEmpty {
-                startRecordingFromKeyboard(requestID: requestedRecordingID)
+                let started = await startRecordingFromKeyboard(
+                    requestID: requestedRecordingID
+                )
 
-                guard bridgeStatus == .recording,
+                guard started,
+                      bridgeStatus == .recording,
                       activeRequestID == requestedRecordingID else {
                     return
                 }
             }
 
-            // Give the microphone graph a brief moment to settle before moving
-            // TypeVoice back to the background. In the auto-start path this
-            // means the user arrives back at the original text field with audio
-            // capture already active.
-            try? await Task.sleep(for: .milliseconds(280))
+            // The foreground fallback still starts real capture before returning.
+            // By the time this delay ends the first microphone buffer has already
+            // arrived, so the user lands back in the text field while recording.
+            try? await Task.sleep(for: .milliseconds(220))
 
             guard let requestedHostBundleID,
                   !requestedHostBundleID.isEmpty
@@ -238,12 +259,19 @@ final class AppModel: ObservableObject {
     func appBecameActive() {
         refreshAuthState()
 
-        // A stopped AVAudioEngine no longer means the whole local service is
-        // gone. Keep serviceReady intact so the keyboard can first attempt a
-        // background microphone recovery.
-        if isServiceReady && !audioService.isRunning {
-            markBridgeChanged()
+        guard isServiceReady else { return }
+
+        Task {
+            _ = await restoreBackgroundExecution(forceReassert: false)
         }
+    }
+
+    private var backgroundWakeReady: Bool {
+        guard isServiceReady else { return false }
+
+        // During recording the capture engine itself keeps execution alive.
+        // At idle, the playback anchor is the readiness source.
+        return backgroundAnchor.isRunning || microphoneCapture.isActive
     }
 
     private func refreshAuthState() {
@@ -265,18 +293,20 @@ final class AppModel: ObservableObject {
             break
 
         case .heartbeat:
-            break
-
-        case .startRecording:
-            if await ensureMicrophoneReadyForRecording(requestID: request.requestID) {
-                startRecordingFromKeyboard(requestID: request.requestID)
+            if isServiceReady,
+               !backgroundWakeReady,
+               !microphoneCapture.isActive {
+                _ = await restoreBackgroundExecution()
             }
 
+        case .startRecording:
+            _ = await startRecordingFromKeyboard(requestID: request.requestID)
+
         case .stopRecording:
-            stopRecordingFromKeyboard(expectedRequestID: request.requestID)
+            await stopRecordingFromKeyboard(expectedRequestID: request.requestID)
 
         case .cancelRecording:
-            cancelRecordingFromKeyboard(expectedRequestID: request.requestID)
+            await cancelRecordingFromKeyboard(expectedRequestID: request.requestID)
 
         case .acknowledgeResult:
             acknowledgeResult(requestID: request.requestID)
@@ -285,98 +315,70 @@ final class AppModel: ObservableObject {
         return currentBridgeState()
     }
 
-    private func ensureMicrophoneReadyForRecording(requestID: String?) async -> Bool {
+    private func restoreBackgroundExecution(
+        forceReassert: Bool = false
+    ) async -> Bool {
         guard isServiceReady else { return false }
 
-        if audioService.isRunning {
+        if !forceReassert, backgroundAnchor.isRunning {
             return true
         }
 
-        if let audioActivationTask {
-            return await audioActivationTask.value
+        if let backgroundRestoreTask {
+            return await backgroundRestoreTask.value
         }
 
         let task = Task { @MainActor [weak self] in
             guard let self else { return false }
 
             do {
-                try await self.activateMicrophoneWithRetry()
-                guard self.isServiceReady else {
-                    self.audioService.cancelRecording(keepWarm: false)
-                    return false
+                if forceReassert {
+                    try await self.audioSessionCoordinator.reassertCurrentProfile()
+                } else {
+                    try await self.audioSessionCoordinator.beginAndWait(.backgroundKeepAlive)
                 }
 
+                try self.backgroundAnchor.start()
                 self.lastError = nil
-                self.bridgeError = nil
-                self.status = .ready
                 self.markBridgeChanged()
                 return true
             } catch {
                 guard !Task.isCancelled else { return false }
-                self.publishBridgeError(
-                    error.localizedDescription,
-                    requestID: requestID
-                )
-                self.status = .failed
+                self.lastError = error.localizedDescription
+                self.markBridgeChanged()
                 return false
             }
         }
 
-        audioActivationTask = task
-        let activated = await task.value
-        audioActivationTask = nil
-        return activated
+        backgroundRestoreTask = task
+        let restored = await task.value
+        backgroundRestoreTask = nil
+        return restored
     }
 
-    private func activateMicrophoneWithRetry() async throws {
-        var retry = 0
-
-        while true {
-            do {
-                let expiry = Date().addingTimeInterval(
-                    TimeInterval(SharedStore.quickStandbySeconds)
-                )
-                try audioService.arm(until: expiry)
-                return
-            } catch {
-                guard Self.isTransientAudioSessionError(error), retry < 4 else {
-                    throw error
-                }
-
-                retry += 1
-                try await Task.sleep(for: .milliseconds(150 * retry))
-            }
+    private func startRecordingFromKeyboard(requestID: String?) async -> Bool {
+        guard let requestID, !requestID.isEmpty else {
+            publishBridgeError("TypeVoice received an invalid recording request.")
+            return false
         }
-    }
 
-    private static func isTransientAudioSessionError(_ error: Error) -> Bool {
-        let code = (error as NSError).code
-
-        // These are the same short-lived audio transition errors observed on
-        // real devices in VoiceKing while moving between a host app, keyboard
-        // extension, and the containing app.
-        return code == 560_557_684 || code == 2_003_329_396
-    }
-
-    private func startRecordingFromKeyboard(requestID: String?) {
-        guard isServiceReady, audioService.isRunning else {
+        guard isServiceReady else {
             publishBridgeError(
                 "Open TypeVoice and enable Quick Dictation first.",
                 requestID: requestID
             )
-            return
-        }
-
-        guard let requestID, !requestID.isEmpty else {
-            publishBridgeError("TypeVoice received an invalid recording request.")
-            return
+            return false
         }
 
         guard bridgeStatus != .starting,
               bridgeStatus != .recording,
               bridgeStatus != .transcribing,
               bridgeStatus != .polishing else {
-            return
+            return bridgeStatus == .recording && activeRequestID == requestID
+        }
+
+        if let recordingStartTask {
+            return await recordingStartTask.value
         }
 
         bridgeStatus = .starting
@@ -387,19 +389,73 @@ final class AppModel: ObservableObject {
         bridgeError = nil
         markBridgeChanged()
 
-        do {
-            _ = try audioService.beginRecording()
-            bridgeStatus = .recording
-            status = .recording
-            lastError = nil
-            markBridgeChanged()
-        } catch {
-            publishBridgeError(error.localizedDescription, requestID: requestID)
-            status = .failed
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return false }
+
+            do {
+                if !self.backgroundWakeReady {
+                    guard await self.restoreBackgroundExecution() else {
+                        throw BackgroundAnchorError.couldNotStart
+                    }
+                }
+
+                try await self.audioSessionCoordinator.beginAndWait(.capture)
+
+                // The keep-alive player is deliberately left running across the
+                // profile switch. If iOS paused it during the category change,
+                // restart it before starting input so there is no execution gap.
+                try? self.backgroundAnchor.start()
+
+                _ = try await self.startMicrophoneWithRecovery()
+
+                self.bridgeStatus = .recording
+                self.status = .recording
+                self.lastError = nil
+                self.bridgeError = nil
+                self.markBridgeChanged()
+                return true
+            } catch {
+                self.microphoneCapture.stopAndDiscard()
+                try? await self.audioSessionCoordinator.endAndWait(.capture)
+                try? self.backgroundAnchor.start()
+
+                self.publishBridgeError(
+                    error.localizedDescription,
+                    requestID: requestID
+                )
+                self.status = .failed
+                return false
+            }
         }
+
+        recordingStartTask = task
+        let started = await task.value
+        recordingStartTask = nil
+        return started
     }
 
-    private func stopRecordingFromKeyboard(expectedRequestID: String?) {
+    private func startMicrophoneWithRecovery() async throws -> URL {
+        var lastError: Error = MicrophoneCaptureError.inputUnavailable
+
+        for attempt in 0..<3 {
+            do {
+                return try await microphoneCapture.startRecording()
+            } catch {
+                lastError = error
+                microphoneCapture.stopAndDiscard()
+
+                guard attempt < 2 else { break }
+
+                try? await audioSessionCoordinator.reassertCurrentProfile()
+                try? backgroundAnchor.start()
+                try await Task.sleep(for: .milliseconds(150 * (attempt + 1)))
+            }
+        }
+
+        throw lastError
+    }
+
+    private func stopRecordingFromKeyboard(expectedRequestID: String?) async {
         guard bridgeStatus == .recording else { return }
 
         guard let requestID = activeRequestID,
@@ -407,11 +463,19 @@ final class AppModel: ObservableObject {
             return
         }
 
-        guard let fileURL = audioService.finishRecording(keepWarm: true) else {
+        // Preserve background execution first, then shut the input engine down.
+        // The privacy indicator can turn off immediately; transcription happens
+        // afterwards with only the playback anchor alive.
+        try? backgroundAnchor.start()
+
+        guard let fileURL = microphoneCapture.finishRecording() else {
             publishBridgeError("Recording file was not available.", requestID: requestID)
             status = .failed
             return
         }
+
+        try? await audioSessionCoordinator.endAndWait(.capture)
+        try? backgroundAnchor.start()
 
         bridgeStatus = .transcribing
         status = .transcribing
@@ -424,14 +488,20 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func cancelRecordingFromKeyboard(expectedRequestID: String?) {
+    private func cancelRecordingFromKeyboard(expectedRequestID: String?) async {
         guard expectedRequestID == nil || expectedRequestID == activeRequestID else {
             return
         }
 
         processingTask?.cancel()
         processingTask = nil
-        audioService.cancelRecording(keepWarm: true)
+        recordingStartTask?.cancel()
+        recordingStartTask = nil
+
+        try? backgroundAnchor.start()
+        microphoneCapture.stopAndDiscard()
+        try? await audioSessionCoordinator.endAndWait(.capture)
+        try? backgroundAnchor.start()
 
         activeRequestID = nil
         responseText = nil
@@ -440,6 +510,33 @@ final class AppModel: ObservableObject {
         bridgeStatus = .idle
         status = isServiceReady ? .ready : .idle
         markBridgeChanged()
+    }
+
+    private func audioInterruptionBegan() {
+        guard isServiceReady else { return }
+
+        markBridgeChanged()
+
+        guard microphoneCapture.isActive || bridgeStatus == .recording else {
+            return
+        }
+
+        let interruptedRequestID = activeRequestID
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            self.microphoneCapture.stopAndDiscard()
+            try? await self.audioSessionCoordinator.endAndWait(.capture)
+
+            if let interruptedRequestID {
+                self.publishBridgeError(
+                    "Microphone session was interrupted.",
+                    requestID: interruptedRequestID
+                )
+                self.status = .failed
+            }
+        }
     }
 
     private func process(fileURL: URL, requestID: String) async {
@@ -542,7 +639,8 @@ final class AppModel: ObservableObject {
             serverID: serverID,
             revision: bridgeRevision,
             serviceReady: isServiceReady,
-            microphoneReady: audioService.isRunning,
+            backgroundWakeReady: backgroundWakeReady,
+            microphoneReady: microphoneCapture.isActive,
             status: bridgeStatus,
             requestID: activeRequestID,
             transcribedText: responseText,
