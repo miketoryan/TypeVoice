@@ -14,7 +14,6 @@ final class AppModel: ObservableObject {
     @Published private(set) var chatGPTAccountSummary: String?
 
     private let audioSessionCoordinator = AudioSessionCoordinator()
-    private let backgroundAnchor = BackgroundExecutionAnchor()
     private let microphoneCapture = MicrophoneCapture()
     private let authManager = ChatGPTAuthManager()
     private let localBridge = LocalBridgeServer()
@@ -189,11 +188,11 @@ final class AppModel: ObservableObject {
         do {
             try await audioSessionCoordinator.beginAndWait(.backgroundKeepAlive)
 
-            // Build and validate the input graph in foreground, then PAUSE it.
-            // Silent playback keeps the app executing while microphone hardware
-            // is expected to be idle.
-            try await microphoneCapture.preparePausedStandby()
-            try backgroundAnchor.start()
+            // v0.20 ActiveSession: start ONE engine in the foreground with only
+            // a looping silent OUTPUT source. The input tap does not exist yet,
+            // so the microphone path remains idle while the engine keeps the app
+            // eligible for background audio execution.
+            try microphoneCapture.armActiveSession()
 
             isServiceReady = true
             status = .ready
@@ -204,7 +203,6 @@ final class AppModel: ObservableObject {
             DarwinBus.post(.serviceChanged)
         } catch {
             microphoneCapture.shutdown()
-            backgroundAnchor.stop()
             audioSessionCoordinator.reset()
             publishBridgeError(
                 error.localizedDescription,
@@ -226,7 +224,6 @@ final class AppModel: ObservableObject {
         backgroundRestoreTask = nil
 
         microphoneCapture.shutdown()
-        backgroundAnchor.stop()
         audioSessionCoordinator.reset()
         discardPreservedAudio()
 
@@ -255,12 +252,11 @@ final class AppModel: ObservableObject {
         Task {
             if !isServiceReady {
                 await arm()
-            } else if !microphoneCapture.isPreparedForResume
-                        || !backgroundAnchor.isRunning {
+            } else if !microphoneCapture.isStandbyReady
+                        && !microphoneCapture.isActive {
                 do {
                     try await audioSessionCoordinator.reassertCurrentProfile()
-                    try await microphoneCapture.preparePausedStandby()
-                    try backgroundAnchor.start()
+                    try microphoneCapture.armActiveSession()
                     bridgeAudioStage = .standbySessionReady
                     lastError = nil
                     markBridgeChanged()
@@ -319,13 +315,16 @@ final class AppModel: ObservableObject {
     func appBecameActive() {
         refreshAuthState()
 
-        guard isServiceReady, !microphoneCapture.isActive else { return }
+        guard isServiceReady,
+              !microphoneCapture.isActive,
+              !microphoneCapture.isStandbyReady else {
+            return
+        }
 
         Task {
             do {
                 try await audioSessionCoordinator.reassertCurrentProfile()
-                try await microphoneCapture.preparePausedStandby()
-                try backgroundAnchor.start()
+                try microphoneCapture.armActiveSession()
                 bridgeAudioStage = .standbySessionReady
                 lastError = nil
                 markBridgeChanged()
@@ -339,13 +338,7 @@ final class AppModel: ObservableObject {
 
     private var backgroundWakeReady: Bool {
         guard isServiceReady else { return false }
-
-        if microphoneCapture.isActive {
-            return true
-        }
-
-        return microphoneCapture.isPreparedForResume
-            && backgroundAnchor.isRunning
+        return microphoneCapture.isStandbyReady || microphoneCapture.isActive
     }
 
     private func refreshAuthState() {
@@ -388,11 +381,10 @@ final class AppModel: ObservableObject {
     private func handleDarwinWake(_ event: DarwinEvent) {
         guard isServiceReady else { return }
 
-        // Paused-engine experiment: Darwin may wake the process, but it must
-        // never rebuild the graph. Warm readiness requires both the prepared
-        // paused graph and the playback anchor that keeps background execution.
-        if !microphoneCapture.isPreparedForResume
-            || (!microphoneCapture.isActive && !backgroundAnchor.isRunning) {
+        // v0.20 ActiveSession: Darwin only carries the wake signal. The one
+        // output-only AVAudioEngine must already be running; a keyboard wake
+        // never starts/restarts the engine in the background.
+        if !backgroundWakeReady {
             bridgeAudioStage = .failed
             markBridgeChanged()
         }
@@ -408,7 +400,7 @@ final class AppModel: ObservableObject {
             break
 
         case .heartbeat:
-            // Readiness is the prepared paused graph + background anchor. A
+            // Readiness means the output-only engine is already running. A
             // heartbeat may report that state but never rebuilds the graph.
             break
 
@@ -517,17 +509,17 @@ final class AppModel: ObservableObject {
         }
 
         do {
-            guard microphoneCapture.isPreparedForResume,
-                  backgroundAnchor.isRunning else {
-                throw MicrophoneCaptureError.warmStandbyUnavailable
+            guard microphoneCapture.isStandbyReady else {
+                throw MicrophoneCaptureError.activeStandbyUnavailable
             }
 
             try await audioSessionCoordinator.beginAndWait(.capture)
             bridgeAudioStage = .captureSessionReady
             markBridgeChanged()
 
-            // Resume the SAME prepared graph from pause. No graph rebuild,
-            // no tap install and no AudioSession category change happens here.
+            // The engine is already running from foreground activation. Starting
+            // dictation only installs an INPUT tap on that live graph; there is
+            // deliberately no AVAudioEngine.start() here.
             bridgeAudioStage = .startingInput
             markBridgeChanged()
             _ = try await microphoneCapture.startRecording()
@@ -536,15 +528,10 @@ final class AppModel: ObservableObject {
 
             guard activeRequestID == requestID,
                   !Task.isCancelled else {
-                microphoneCapture.discardRecordingAndPause()
+                microphoneCapture.discardRecordingToStandby()
                 try? await audioSessionCoordinator.endAndWait(.capture)
-                try? backgroundAnchor.start()
                 return false
             }
-
-            // Once real input buffers are flowing, capture itself keeps the app
-            // active; the silent playback anchor is no longer needed.
-            backgroundAnchor.stop()
 
             bridgeStatus = .recording
             bridgeRequestClaimed = true
@@ -559,9 +546,8 @@ final class AppModel: ObservableObject {
         } catch is CancellationError {
             return false
         } catch {
-            microphoneCapture.discardRecordingAndPause()
+            microphoneCapture.discardRecordingToStandby()
             try? await audioSessionCoordinator.endAndWait(.capture)
-            try? backgroundAnchor.start()
 
             guard activeRequestID == requestID else { return false }
 
@@ -582,7 +568,7 @@ final class AppModel: ObservableObject {
     ) async -> Bool {
         guard isServiceReady else { return false }
 
-        if !forceReassert, backgroundAnchor.isRunning {
+        if !forceReassert, microphoneCapture.isStandbyReady {
             return true
         }
 
@@ -600,7 +586,7 @@ final class AppModel: ObservableObject {
                     try await self.audioSessionCoordinator.beginAndWait(.backgroundKeepAlive)
                 }
 
-                try self.backgroundAnchor.start()
+                try self.microphoneCapture.armActiveSession()
                 self.lastError = nil
                 self.markBridgeChanged()
                 return true
@@ -626,13 +612,12 @@ final class AppModel: ObservableObject {
             return
         }
 
-        // Start silent playback before pausing input so background execution
-        // has no gap. Then close the file gate and pause the prepared engine.
+        // Remove only the input tap. The SAME output-only engine keeps running,
+        // so returning to standby requires no stop/pause/start transition.
         bridgeAudioStage = .returningToStandby
         markBridgeChanged()
-        try? backgroundAnchor.start()
 
-        guard let fileURL = microphoneCapture.finishRecordingAndPause() else {
+        guard let fileURL = microphoneCapture.finishRecordingToStandby() else {
             publishBridgeError(
                 "Recording file was not available.",
                 requestID: requestID,
@@ -709,8 +694,7 @@ final class AppModel: ObservableObject {
             || bridgeStatus == .starting
 
         if hadCapture {
-            try? backgroundAnchor.start()
-            microphoneCapture.discardRecordingAndPause()
+            microphoneCapture.discardRecordingToStandby()
             try? await audioSessionCoordinator.endAndWait(.capture)
         }
 
@@ -727,26 +711,29 @@ final class AppModel: ObservableObject {
         guard isServiceReady else { return }
 
         let interruptedRequestID = activeRequestID
-
-        guard microphoneCapture.isActive
-                || bridgeStatus == .recording
-                || bridgeStatus == .starting else {
-            markBridgeChanged()
-            return
-        }
+        let hadCapture =
+            microphoneCapture.isActive
+            || bridgeStatus == .recording
+            || bridgeStatus == .starting
 
         recordingStartTask?.cancel()
         recordingStartTask = nil
         recordingStartRequestID = nil
 
+        // An interruption can stop the persistent output engine even while idle.
+        // Drop the graph immediately so readiness can never claim a dead engine.
+        microphoneCapture.shutdown()
+
         Task { @MainActor [weak self] in
             guard let self else { return }
 
-            self.microphoneCapture.shutdown()
-            try? await self.audioSessionCoordinator.endAndWait(.capture)
+            if hadCapture {
+                try? await self.audioSessionCoordinator.endAndWait(.capture)
+            }
             self.bridgeAudioStage = .failed
 
-            if let interruptedRequestID,
+            if hadCapture,
+               let interruptedRequestID,
                self.activeRequestID == interruptedRequestID {
                 self.publishBridgeError(
                     "Microphone session was interrupted.",
@@ -756,6 +743,8 @@ final class AppModel: ObservableObject {
                     claimed: true
                 )
                 self.status = .failed
+            } else {
+                self.markBridgeChanged()
             }
         }
     }
