@@ -10,6 +10,7 @@ struct ColdStartMicLink: View {
     let hostBundleID: String?
     let requestID: String
     var mode: Mode = .speak
+    var onActivate: (() -> Void)? = nil
 
     private var destination: URL {
         var components = URLComponents()
@@ -68,6 +69,11 @@ struct ColdStartMicLink: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .simultaneousGesture(
+            TapGesture().onEnded {
+                onActivate?()
+            }
+        )
         .accessibilityLabel(
             mode == .recover
                 ? (isEnglish ? "Open TypeVoice and restore microphone standby" : "打开 TypeVoice 恢复麦克风待机")
