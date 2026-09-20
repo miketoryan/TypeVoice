@@ -189,10 +189,11 @@ final class AppModel: ObservableObject {
         do {
             try await audioSessionCoordinator.beginAndWait(.backgroundKeepAlive)
 
-            // Warm the input graph while TypeVoice is foregrounded. From this
-            // point on, keyboard requests only open/close the recording gate.
-            try await microphoneCapture.warmUp()
-            backgroundAnchor.stop()
+            // Build and validate the input graph in foreground, then PAUSE it.
+            // Silent playback keeps the app executing while microphone hardware
+            // is expected to be idle.
+            try await microphoneCapture.preparePausedStandby()
+            try backgroundAnchor.start()
 
             isServiceReady = true
             status = .ready
@@ -254,11 +255,12 @@ final class AppModel: ObservableObject {
         Task {
             if !isServiceReady {
                 await arm()
-            } else if !microphoneCapture.isWarmReady {
+            } else if !microphoneCapture.isPreparedForResume
+                        || !backgroundAnchor.isRunning {
                 do {
                     try await audioSessionCoordinator.reassertCurrentProfile()
-                    try await microphoneCapture.warmUp()
-                    backgroundAnchor.stop()
+                    try await microphoneCapture.preparePausedStandby()
+                    try backgroundAnchor.start()
                     bridgeAudioStage = .standbySessionReady
                     lastError = nil
                     markBridgeChanged()
@@ -317,13 +319,13 @@ final class AppModel: ObservableObject {
     func appBecameActive() {
         refreshAuthState()
 
-        guard isServiceReady, !microphoneCapture.isWarmReady else { return }
+        guard isServiceReady, !microphoneCapture.isActive else { return }
 
         Task {
             do {
                 try await audioSessionCoordinator.reassertCurrentProfile()
-                try await microphoneCapture.warmUp()
-                backgroundAnchor.stop()
+                try await microphoneCapture.preparePausedStandby()
+                try backgroundAnchor.start()
                 bridgeAudioStage = .standbySessionReady
                 lastError = nil
                 markBridgeChanged()
@@ -337,7 +339,13 @@ final class AppModel: ObservableObject {
 
     private var backgroundWakeReady: Bool {
         guard isServiceReady else { return false }
-        return microphoneCapture.isWarmReady
+
+        if microphoneCapture.isActive {
+            return true
+        }
+
+        return microphoneCapture.isPreparedForResume
+            && backgroundAnchor.isRunning
     }
 
     private func refreshAuthState() {
@@ -380,10 +388,11 @@ final class AppModel: ObservableObject {
     private func handleDarwinWake(_ event: DarwinEvent) {
         guard isServiceReady else { return }
 
-        // Warm-engine experiment: never call AVAudioEngine.start() from a
-        // background Darwin wake. If the graph died, the keyboard will receive
-        // a precise warmStandbyUnavailable failure and offer a real Link.
-        if !microphoneCapture.isWarmReady {
+        // Paused-engine experiment: Darwin may wake the process, but it must
+        // never rebuild the graph. Warm readiness requires both the prepared
+        // paused graph and the playback anchor that keeps background execution.
+        if !microphoneCapture.isPreparedForResume
+            || (!microphoneCapture.isActive && !backgroundAnchor.isRunning) {
             bridgeAudioStage = .failed
             markBridgeChanged()
         }
@@ -399,8 +408,8 @@ final class AppModel: ObservableObject {
             break
 
         case .heartbeat:
-            // Readiness is now the actual warm input graph. A heartbeat may
-            // report that state, but it must never start the engine in background.
+            // Readiness is the prepared paused graph + background anchor. A
+            // heartbeat may report that state but never rebuilds the graph.
             break
 
         case .startRecording:
@@ -508,7 +517,8 @@ final class AppModel: ObservableObject {
         }
 
         do {
-            guard microphoneCapture.isWarmReady else {
+            guard microphoneCapture.isPreparedForResume,
+                  backgroundAnchor.isRunning else {
                 throw MicrophoneCaptureError.warmStandbyUnavailable
             }
 
@@ -516,8 +526,8 @@ final class AppModel: ObservableObject {
             bridgeAudioStage = .captureSessionReady
             markBridgeChanged()
 
-            // The AVAudioEngine is already running. This only opens the file
-            // gate and waits for the next warm buffer to be written.
+            // Resume the SAME prepared graph from pause. No graph rebuild,
+            // no tap install and no AudioSession category change happens here.
             bridgeAudioStage = .startingInput
             markBridgeChanged()
             _ = try await microphoneCapture.startRecording()
@@ -526,10 +536,15 @@ final class AppModel: ObservableObject {
 
             guard activeRequestID == requestID,
                   !Task.isCancelled else {
-                microphoneCapture.discardRecording()
+                microphoneCapture.discardRecordingAndPause()
                 try? await audioSessionCoordinator.endAndWait(.capture)
+                try? backgroundAnchor.start()
                 return false
             }
+
+            // Once real input buffers are flowing, capture itself keeps the app
+            // active; the silent playback anchor is no longer needed.
+            backgroundAnchor.stop()
 
             bridgeStatus = .recording
             bridgeRequestClaimed = true
@@ -544,8 +559,9 @@ final class AppModel: ObservableObject {
         } catch is CancellationError {
             return false
         } catch {
-            microphoneCapture.discardRecording()
+            microphoneCapture.discardRecordingAndPause()
             try? await audioSessionCoordinator.endAndWait(.capture)
+            try? backgroundAnchor.start()
 
             guard activeRequestID == requestID else { return false }
 
@@ -610,11 +626,13 @@ final class AppModel: ObservableObject {
             return
         }
 
-        // Close only the recording file gate. The input engine stays warm.
+        // Start silent playback before pausing input so background execution
+        // has no gap. Then close the file gate and pause the prepared engine.
         bridgeAudioStage = .returningToStandby
         markBridgeChanged()
+        try? backgroundAnchor.start()
 
-        guard let fileURL = microphoneCapture.finishRecording() else {
+        guard let fileURL = microphoneCapture.finishRecordingAndPause() else {
             publishBridgeError(
                 "Recording file was not available.",
                 requestID: requestID,
@@ -691,7 +709,8 @@ final class AppModel: ObservableObject {
             || bridgeStatus == .starting
 
         if hadCapture {
-            microphoneCapture.discardRecording()
+            try? backgroundAnchor.start()
+            microphoneCapture.discardRecordingAndPause()
             try? await audioSessionCoordinator.endAndWait(.capture)
         }
 
