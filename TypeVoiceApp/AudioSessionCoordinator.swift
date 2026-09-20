@@ -96,6 +96,17 @@ final class AudioSessionCoordinator {
         try await applyHighestIntent()
     }
 
+    /// Foreground recovery entry point. Inserts/retains the requested intent and
+    /// forces AVAudioSession.setActive(true) even if our cached state still says
+    /// the session is active. iOS may suspend/invalidate audio IO while keeping
+    /// the app process alive, so cached sessionIsActive is not authoritative
+    /// after a long background interval.
+    func beginAndReassert(_ intent: Intent) async throws {
+        activeIntents.insert(intent)
+        sessionIsActive = false
+        try await applyHighestIntent(force: true)
+    }
+
     func endAndWait(_ intent: Intent) async throws {
         activeIntents.remove(intent)
         try await applyHighestIntent()
