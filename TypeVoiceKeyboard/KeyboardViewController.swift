@@ -159,15 +159,21 @@ final class KeyboardViewController: UIInputViewController {
                 )
             } else if latestState.failureKind == .authRequired {
                 openTypeVoiceForAccountRecovery()
+            } else if warmServiceIsUsable {
+                startWarmRecordingRequest()
             } else {
                 launchTypeVoiceAndResumeRecording()
             }
 
         default:
-            // Stable jump-first rule: starting a new dictation always foregrounds
-            // TypeVoice once, starts microphone IO there, then returns to the host.
-            // Do not spend time probing a background service that is not relied on.
-            launchTypeVoiceAndResumeRecording()
+            // During the configured short microphone standby window, the main app
+            // is genuinely alive because microphone IO is still running. Start
+            // directly with no Ping/Pong delay. Outside that window, jump first.
+            if warmServiceIsUsable {
+                startWarmRecordingRequest()
+            } else {
+                launchTypeVoiceAndResumeRecording()
+            }
         }
     }
 
@@ -450,6 +456,45 @@ final class KeyboardViewController: UIInputViewController {
                 }
             }
         }
+    }
+
+    private var warmServiceIsUsable: Bool {
+        latestState.serviceReady
+            && latestState.backgroundWakeReady
+            && latestState.microphoneReady
+            && bridgeLeaseIsFresh
+    }
+
+    private func startWarmRecordingRequest() {
+        guard pendingForegroundRecordingRequestID == nil else { return }
+
+        let requestID = UUID().uuidString
+        currentRequestID = requestID
+        mayAutoInsert = true
+        insertionScheduledForRequestID = nil
+        foregroundFallbackRequestID = nil
+
+        latestState = BridgeState(
+            serverID: latestState.serverID,
+            revision: latestState.revision &+ 1,
+            serviceReady: latestState.serviceReady,
+            quickDictationEnabled: latestState.quickDictationEnabled,
+            backgroundWakeReady: latestState.backgroundWakeReady,
+            microphoneReady: latestState.microphoneReady,
+            requestClaimed: false,
+            audioStage: .claimed,
+            status: .starting,
+            failureKind: nil,
+            retryAvailable: false,
+            requestID: requestID,
+            transcribedText: nil,
+            resultCreatedAt: nil,
+            lastError: nil,
+            interfaceLanguage: latestState.interfaceLanguage
+        )
+
+        refreshUI()
+        sendCommand(.startRecording, requestID: requestID)
     }
 
     private func apply(_ state: BridgeState) {
