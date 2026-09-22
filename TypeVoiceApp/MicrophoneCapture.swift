@@ -9,36 +9,33 @@ final class MicrophoneCapture {
     private var recordingFile: AVAudioFile?
     private var recordingURL: URL?
     private var tapInstalled = false
-    private var receivedWarmBuffer = false
     private var receivedRecordingBuffer = false
-    private var lastAudioBufferTimestamp: TimeInterval = 0
-    private var standbyExpiryTimestamp: TimeInterval = 0
-    private var standbyGeneration: UInt64 = 0
 
-    /// Fired on the main queue when the CURRENT warm-idle window expires.
-    /// A generation token prevents a delayed timeout callback from an older
-    /// session from tearing down a microphone that has already been re-warmed.
+    /// ACTIVE service state. This deliberately does NOT mean that microphone
+    /// input is running. TypeVoice prepares the service while foregrounded,
+    /// keeps the background audio service alive, and only opens microphone IO
+    /// for an actual dictation.
+    private var servicePrepared = false
+
+    private var standbyGeneration: UInt64 = 0
+    private var standbyTask: Task<Void, Never>?
+
     var onStandbyExpired: (() -> Void)?
 
-    /// True only while one dictation is being written to disk.
+    /// True only while one dictation is actively capturing microphone buffers.
     var isActive: Bool {
-        isRecording && isWarmReady
+        isRecording && isEngineRunning
     }
 
-    /// Warm-microphone invariant:
-    /// - the input AVAudioEngine was started while TypeVoice was foregrounded;
-    /// - one persistent input tap stays installed for the whole ready window;
-    /// - idle buffers are discarded unless recordingFile is non-nil.
-    ///
-    /// This avoids every background attempt to restart microphone input.
+    /// Compatibility name used by the rest of the app. In the ACTIVE-service
+    /// architecture this means "the foreground-prepared voice service is ready",
+    /// not "the microphone is currently open".
     var isWarmReady: Bool {
-        engine?.isRunning == true
-            && tapInstalled
-            && hasRecentAudioFlow
+        servicePrepared
     }
 
     var isStandbyReady: Bool {
-        isWarmReady && !isRecording
+        servicePrepared && !isRecording
     }
 
     var isEngineRunning: Bool {
@@ -63,108 +60,85 @@ final class MicrophoneCapture {
         }
     }
 
-    /// Starts the microphone input graph once while TypeVoice is foregrounded.
-    /// The tap remains installed until the configured standby window expires,
-    /// Quick Dictation is disabled, or iOS interrupts/resets the audio service.
+    /// Prepare the ACTIVE service without touching microphone input.
+    ///
+    /// The containing app has already activated AVAudioSession and started its
+    /// background audio anchor before calling this method. No AVAudioEngine input
+    /// node or tap is started here, so the microphone privacy indicator remains off.
     func warmUp(
         firstBufferTimeout: Duration = .milliseconds(900)
     ) async throws {
-        if isWarmReady {
+        guard !isRecording else {
+            throw MicrophoneCaptureError.alreadyRecording
+        }
+
+        teardownInputEngine()
+        servicePrepared = true
+    }
+
+    /// Service-idle timeout. Unlike the previous implementation this timer is
+    /// not driven by discarded microphone buffers. The background audio service
+    /// keeps the process eligible to run while ACTIVE.
+    func setStandbyExpiry(after seconds: TimeInterval) {
+        clearStandbyExpiry()
+
+        guard servicePrepared,
+              !isRecording,
+              seconds > 0 else {
             return
+        }
+
+        standbyGeneration &+= 1
+        let generation = standbyGeneration
+        let nanoseconds = UInt64(seconds * 1_000_000_000)
+
+        standbyTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: nanoseconds)
+            } catch {
+                return
+            }
+
+            guard let self,
+                  self.standbyGeneration == generation,
+                  self.servicePrepared,
+                  !self.isRecording else {
+                return
+            }
+
+            self.onStandbyExpired?()
+        }
+    }
+
+    func clearStandbyExpiry() {
+        standbyGeneration &+= 1
+        standbyTask?.cancel()
+        standbyTask = nil
+    }
+
+    /// Open microphone IO only for the actual dictation.
+    ///
+    /// The AVAudioSession is already active from the foreground-prepared service.
+    /// If iOS still rejects starting input from the background, the caller reports
+    /// audioStartFailed and the keyboard falls back to the foreground handoff.
+    func startRecording(
+        firstBufferTimeout: Duration = .milliseconds(650)
+    ) async throws -> URL {
+        guard servicePrepared else {
+            throw MicrophoneCaptureError.warmStandbyUnavailable
         }
 
         guard !isRecording else {
             throw MicrophoneCaptureError.alreadyRecording
         }
 
-        shutdown(removeRecording: true)
+        clearStandbyExpiry()
+        teardownInputEngine()
 
         let newEngine = AVAudioEngine()
         let input = newEngine.inputNode
         let format = input.outputFormat(forBus: 0)
 
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            throw MicrophoneCaptureError.inputUnavailable
-        }
-
-        lock.lock()
-        receivedWarmBuffer = false
-        receivedRecordingBuffer = false
-        lastAudioBufferTimestamp = 0
-        lock.unlock()
-
-        // Use the input bus's live format. Passing nil is more resilient across
-        // route changes than pinning a format read just before installTap().
-        input.installTap(
-            onBus: 0,
-            bufferSize: 2_048,
-            format: nil
-        ) { [weak self] buffer, _ in
-            self?.consume(buffer)
-        }
-        tapInstalled = true
-
-        newEngine.prepare()
-
-        do {
-            try newEngine.start()
-            engine = newEngine
-        } catch {
-            input.removeTap(onBus: 0)
-            tapInstalled = false
-            engine = nil
-            throw error
-        }
-
-        let startedAt = ContinuousClock.now
-        while !hasReceivedWarmBuffer {
-            if ContinuousClock.now - startedAt >= firstBufferTimeout {
-                shutdown(removeRecording: true)
-                throw MicrophoneCaptureError.noAudioFlow
-            }
-            try await Task.sleep(for: .milliseconds(20))
-        }
-    }
-
-    /// Arms or refreshes the idle warm-microphone deadline. The deadline is
-    /// checked from the audio render callback itself rather than a background
-    /// Timer/Task, so the 10 s / 30 s / 1 min / 5 min window remains reliable
-    /// while the app is backgrounded.
-    func setStandbyExpiry(after seconds: TimeInterval) {
-        lock.lock()
-        standbyGeneration &+= 1
-        if recordingFile == nil, seconds > 0 {
-            standbyExpiryTimestamp = Date().timeIntervalSince1970 + seconds
-        } else {
-            standbyExpiryTimestamp = 0
-        }
-        lock.unlock()
-    }
-
-    func clearStandbyExpiry() {
-        lock.lock()
-        standbyGeneration &+= 1
-        standbyExpiryTimestamp = 0
-        lock.unlock()
-    }
-
-    /// Opens only the file gate on the already-running input engine.
-    /// No AudioSession activation, tap install, graph rebuild or engine.start()
-    /// occurs on the warm/background path.
-    func startRecording(
-        firstBufferTimeout: Duration = .milliseconds(650)
-    ) async throws -> URL {
-        guard !isRecording else {
-            throw MicrophoneCaptureError.alreadyRecording
-        }
-
-        guard isWarmReady,
-              let engine,
-              engine.isRunning else {
-            throw MicrophoneCaptureError.warmStandbyUnavailable
-        }
-
-        let format = engine.inputNode.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
             throw MicrophoneCaptureError.inputUnavailable
         }
@@ -184,9 +158,36 @@ final class MicrophoneCapture {
         recordingURL = url
         recordingFile = file
         receivedRecordingBuffer = false
-        standbyGeneration &+= 1
-        standbyExpiryTimestamp = 0
         lock.unlock()
+
+        input.installTap(
+            onBus: 0,
+            bufferSize: 2_048,
+            format: nil
+        ) { [weak self] buffer, _ in
+            self?.consume(buffer)
+        }
+        tapInstalled = true
+
+        newEngine.prepare()
+
+        do {
+            try newEngine.start()
+            engine = newEngine
+        } catch {
+            input.removeTap(onBus: 0)
+            tapInstalled = false
+            engine = nil
+
+            lock.lock()
+            recordingFile = nil
+            recordingURL = nil
+            receivedRecordingBuffer = false
+            lock.unlock()
+
+            try? FileManager.default.removeItem(at: url)
+            throw error
+        }
 
         let startedAt = ContinuousClock.now
         while !hasReceivedRecordingBuffer {
@@ -200,7 +201,8 @@ final class MicrophoneCapture {
         return url
     }
 
-    /// Ends one capture window but intentionally leaves microphone input hot.
+    /// Finish this recording and immediately release microphone input while
+    /// keeping the ACTIVE service prepared for the next keyboard activation.
     func finishRecording() -> URL? {
         lock.lock()
         let url = recordingURL
@@ -208,10 +210,12 @@ final class MicrophoneCapture {
         recordingURL = nil
         receivedRecordingBuffer = false
         lock.unlock()
+
+        teardownInputEngine()
         return url
     }
 
-    /// Cancels one capture window but intentionally leaves microphone input hot.
+    /// Cancel this recording, release microphone input, but keep ACTIVE service.
     func discardRecording() {
         lock.lock()
         let url = recordingURL
@@ -220,63 +224,30 @@ final class MicrophoneCapture {
         receivedRecordingBuffer = false
         lock.unlock()
 
+        teardownInputEngine()
+
         if let url {
             try? FileManager.default.removeItem(at: url)
         }
     }
 
-    /// Fully releases microphone input and turns off the privacy indicator.
+    /// Fully release both microphone input and the prepared service state.
     func shutdown(removeRecording: Bool = true) {
+        clearStandbyExpiry()
+
         lock.lock()
         let url = recordingURL
         recordingFile = nil
         recordingURL = nil
-        receivedWarmBuffer = false
         receivedRecordingBuffer = false
-        lastAudioBufferTimestamp = 0
-        standbyGeneration &+= 1
-        standbyExpiryTimestamp = 0
         lock.unlock()
 
-        if let engine {
-            if tapInstalled {
-                engine.inputNode.removeTap(onBus: 0)
-            }
-
-            if engine.isRunning {
-                engine.stop()
-            }
-
-            engine.reset()
-        }
-
-        tapInstalled = false
-        engine = nil
+        teardownInputEngine()
+        servicePrepared = false
 
         if removeRecording, let url {
             try? FileManager.default.removeItem(at: url)
         }
-    }
-
-    private var hasReceivedWarmBuffer: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return receivedWarmBuffer
-    }
-
-    /// AVAudioEngine.isRunning can stay true for a zombie input graph after a
-    /// route/interruption/suspension event. Treat the warm path as healthy only
-    /// if the tap has delivered a real buffer recently.
-    private var hasRecentAudioFlow: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-
-        guard receivedWarmBuffer,
-              lastAudioBufferTimestamp > 0 else {
-            return false
-        }
-
-        return Date().timeIntervalSince1970 - lastAudioBufferTimestamp < 2.5
     }
 
     private var hasReceivedRecordingBuffer: Bool {
@@ -286,47 +257,31 @@ final class MicrophoneCapture {
     }
 
     private func consume(_ buffer: AVAudioPCMBuffer) {
-        let now = Date().timeIntervalSince1970
-        var expiredGeneration: UInt64?
-
         lock.lock()
-        receivedWarmBuffer = true
-        lastAudioBufferTimestamp = now
-
         if let file = recordingFile {
             receivedRecordingBuffer = true
             try? file.write(from: buffer)
-        } else if standbyExpiryTimestamp > 0,
-                  now >= standbyExpiryTimestamp {
-            standbyExpiryTimestamp = 0
-            expiredGeneration = standbyGeneration
         }
-        // When recordingFile == nil, the warm tap deliberately discards the
-        // buffer. Keeping the tap alive is what preserves background mic IO.
         lock.unlock()
-
-        if let expiredGeneration {
-            DispatchQueue.main.async { [weak self] in
-                self?.deliverStandbyExpiryIfCurrent(expiredGeneration)
-            }
-        }
     }
 
-    private func deliverStandbyExpiryIfCurrent(_ generation: UInt64) {
-        lock.lock()
-        let isCurrent =
-            standbyGeneration == generation
-            && standbyExpiryTimestamp == 0
-            && recordingFile == nil
-        lock.unlock()
-
-        guard isCurrent else {
-            // A newer keyboard-visible lease, recording, warm-up, or shutdown
-            // superseded this callback before the main queue delivered it.
+    private func teardownInputEngine() {
+        guard let engine else {
+            tapInstalled = false
             return
         }
 
-        onStandbyExpired?()
+        if tapInstalled {
+            engine.inputNode.removeTap(onBus: 0)
+        }
+
+        if engine.isRunning {
+            engine.stop()
+        }
+
+        engine.reset()
+        tapInstalled = false
+        self.engine = nil
     }
 }
 
@@ -343,9 +298,9 @@ enum MicrophoneCaptureError: LocalizedError {
         case .inputUnavailable:
             return "The microphone input is unavailable."
         case .warmStandbyUnavailable:
-            return "The warm microphone session has ended. Open TypeVoice to reactivate it."
+            return "The voice service is no longer active. Open TypeVoice to reactivate it."
         case .noAudioFlow:
-            return "The microphone is active but no audio arrived."
+            return "The microphone started but no audio arrived."
         }
     }
 }
