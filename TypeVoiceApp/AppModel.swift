@@ -5,11 +5,7 @@ import UIKit
 
 @MainActor
 final class AppModel: ObservableObject {
-    private struct PendingKeyboardActivation {
-        let requestID: String
-        let hostBundleID: String?
-        let shouldAutoStart: Bool
-    }
+
 
     @Published private(set) var status: TypeVoiceStatus = .idle
     @Published private(set) var isQuickDictationEnabled = SharedStore.quickDictationEnabled
@@ -46,8 +42,6 @@ final class AppModel: ObservableObject {
     private var recordingStartTask: Task<Bool, Never>?
     private var recordingStartRequestID: String?
     private var foregroundWarmupTask: Task<Bool, Never>?
-    private var activationResolutionTask: Task<Void, Never>?
-    private var pendingKeyboardActivation: PendingKeyboardActivation?
     private var keyboardIsVisible = false
     private var keyboardHasBeenSeen = false
     private var keyboardExitedAt: Date?
@@ -124,7 +118,6 @@ final class AppModel: ObservableObject {
         loginTask?.cancel()
         recordingStartTask?.cancel()
         foregroundWarmupTask?.cancel()
-        activationResolutionTask?.cancel()
         darwinObservations.removeAll()
         localBridge.stop()
     }
@@ -237,9 +230,6 @@ final class AppModel: ObservableObject {
         recordingStartRequestID = nil
         foregroundWarmupTask?.cancel()
         foregroundWarmupTask = nil
-        activationResolutionTask?.cancel()
-        activationResolutionTask = nil
-        pendingKeyboardActivation = nil
 
         microphoneCapture.shutdown()
         audioSessionCoordinator.reset()
@@ -256,27 +246,34 @@ final class AppModel: ObservableObject {
         DarwinBus.post(.serviceChanged)
     }
 
-    func handleOpenURL(_ url: URL) {
-        guard url.scheme?.lowercased() == "typevoice" else { return }
-        guard url.host?.lowercased() == "prepare" else { return }
-
-        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-        let source = components?.queryItems?
-            .first(where: { $0.name == "source" })?.value
-        let requestedHostBundleID = components?.queryItems?
-            .first(where: { $0.name == "host" })?.value
-        let requestedRecordingID = components?.queryItems?
-            .first(where: { $0.name == "request" })?.value
-        let shouldAutoStart = components?.queryItems?
-            .first(where: { $0.name == "autostart" })?.value == "1"
-
-        guard source == "keyboard" else {
+    func handleIncomingURL(_ url: URL) async {
+        guard url.scheme?.lowercased() == "typevoice",
+              url.host?.lowercased() == "start-recording" else {
             refreshAuthState()
             return
         }
 
-        guard let requestedRecordingID,
-              !requestedRecordingID.isEmpty else {
+        let components = URLComponents(
+            url: url,
+            resolvingAgainstBaseURL: false
+        )
+        let queryItems = components?.queryItems ?? []
+        let requestID = queryItems.first(where: {
+            $0.name == "requestID"
+        })?.value
+        let returnBundleIdentifier = queryItems.first(where: {
+            $0.name == "returnBundleIdentifier"
+        })?.value
+
+        guard isQuickDictationEnabled else {
+            lastError = "Quick Dictation is disabled. Enable it in TypeVoice first."
+            status = .idle
+            markBridgeChanged()
+            DarwinBus.post(.serviceChanged)
+            return
+        }
+
+        guard let requestID, !requestID.isEmpty else {
             publishBridgeError(
                 "TypeVoice received an invalid keyboard activation request.",
                 kind: .bridgeUnavailable,
@@ -286,155 +283,67 @@ final class AppModel: ObservableObject {
             return
         }
 
-        guard isQuickDictationEnabled else {
-            pendingKeyboardActivation = nil
-            lastError = "Quick Dictation is disabled. Enable it in TypeVoice first."
-            status = .idle
-            markBridgeChanged()
-            DarwinBus.post(.serviceChanged)
+        // VoiceKing-style foreground fallback: prepare microphone IO in the app,
+        // start the actual recording file while still foregrounded, then return.
+        // TypeVoice adds one stricter condition: startRecording() must have seen a
+        // real microphone buffer before the host app is reopened.
+        let audioReady = await ensureForegroundWarmSession(
+            requestID: requestID
+        )
+        guard audioReady else {
             return
         }
 
-        // Dictus-style cold-start parking: URL delivery commonly arrives while
-        // UIApplication is still .inactive. Never start AVAudioEngine here unless
-        // the app has already become active. appBecameActive() is the primary
-        // consumer; the explicit active check handles the inverse event ordering
-        // where scene activation wins the race and the URL arrives second.
-        pendingKeyboardActivation = PendingKeyboardActivation(
-            requestID: requestedRecordingID,
-            hostBundleID: requestedHostBundleID,
-            shouldAutoStart: shouldAutoStart
+        claimRecordingRequest(
+            requestID,
+            forceAudioRetry: true
         )
 
-        if UIApplication.shared.applicationState == .active {
-            resolvePendingKeyboardActivationIfPossible()
+        var recordingConfirmed = false
+        if recordingStartRequestID == requestID,
+           let recordingStartTask {
+            let started = await recordingStartTask.value
+            recordingConfirmed =
+                started
+                && bridgeStatus == .recording
+                && activeRequestID == requestID
+                && microphoneCapture.isRecording
+        } else {
+            recordingConfirmed =
+                bridgeStatus == .recording
+                && activeRequestID == requestID
+                && microphoneCapture.isRecording
         }
-    }
 
-    private func resolvePendingKeyboardActivationIfPossible() {
-        guard UIApplication.shared.applicationState == .active,
-              activationResolutionTask == nil,
-              let pendingKeyboardActivation else {
-            return
-        }
-
-        let pending = pendingKeyboardActivation
-
-        activationResolutionTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-
-            var audioReady = false
-            var recordingConfirmed = false
-
-            if pending.shouldAutoStart {
-                // A foreground handoff is not complete merely because TypeVoice
-                // became active. Only return to the host after startRecording()
-                // has received a real microphone buffer and bridgeStatus is
-                // RECORDING. Rebuild/retry here while the app is foregrounded
-                // instead of returning a false-success to the keyboard.
-                for attempt in 0..<3 {
-                    guard !Task.isCancelled,
-                          UIApplication.shared.applicationState == .active else {
-                        break
-                    }
-
-                    audioReady = await self.ensureForegroundWarmSession(
-                        requestID: pending.requestID
-                    )
-
-                    if audioReady {
-                        self.claimRecordingRequest(
-                            pending.requestID,
-                            forceAudioRetry: true
-                        )
-
-                        var started = false
-                        if self.recordingStartRequestID == pending.requestID,
-                           let recordingStartTask = self.recordingStartTask {
-                            started = await recordingStartTask.value
-                        } else {
-                            started =
-                                self.bridgeStatus == .recording
-                                && self.activeRequestID == pending.requestID
-                                && self.microphoneCapture.isRecording
-                        }
-
-                        recordingConfirmed =
-                            started
-                            && self.bridgeStatus == .recording
-                            && self.activeRequestID == pending.requestID
-                            && self.microphoneCapture.isRecording
-
-                        if recordingConfirmed {
-                            break
-                        }
-                    }
-
-                    guard attempt < 2 else { break }
-
-                    // Cleanly rebuild the whole foreground audio path before the
-                    // next attempt. This avoids carrying a half-started engine or
-                    // stale bridge error into the retry.
-                    self.recordingStartTask?.cancel()
-                    self.recordingStartTask = nil
-                    self.recordingStartRequestID = nil
-                    self.microphoneCapture.discardRecording()
-                    self.microphoneCapture.shutdown(removeRecording: false)
-                    self.isServiceReady = false
-                    await self.audioSessionCoordinator.resetAndWait()
-                    self.resetBridgeToIdle(clearRequest: false)
-                    self.bridgeAudioStage = .idle
-                    self.status = .starting
-                    self.lastError = nil
-
-                    try? await Task.sleep(
-                        for: attempt == 0
-                            ? .milliseconds(160)
-                            : .milliseconds(260)
-                    )
-                }
-            } else {
-                audioReady = await self.ensureForegroundWarmSession(
-                    requestID: pending.requestID
-                )
-                recordingConfirmed = audioReady
-            }
-
-            if recordingConfirmed,
-               let hostBundleID = pending.hostBundleID,
-               !hostBundleID.isEmpty {
-                // startRecording() has already seen a real input buffer at this
-                // point. Give SpringBoard one short turn, then return.
-                try? await Task.sleep(for: .milliseconds(100))
-
-                if !PreviousAppReturner.open(bundleID: hostBundleID) {
-                    try? await Task.sleep(for: .milliseconds(180))
-                    _ = PreviousAppReturner.open(bundleID: hostBundleID)
-                }
-            } else if pending.shouldAutoStart,
-                      self.bridgeStatus != .error {
-                self.publishBridgeError(
-                    "TypeVoice could not confirm microphone recording after foreground activation.",
-                    requestID: pending.requestID,
+        guard recordingConfirmed else {
+            if bridgeStatus != .error {
+                publishBridgeError(
+                    "TypeVoice could not confirm microphone recording.",
+                    requestID: requestID,
                     kind: .audioStartFailed,
                     retryAvailable: false,
                     claimed: true
                 )
-                self.status = .failed
+                status = .failed
             }
+            return
+        }
 
-            if self.pendingKeyboardActivation?.requestID == pending.requestID {
-                self.pendingKeyboardActivation = nil
-            }
-            self.activationResolutionTask = nil
+        // Same short return delay used by VoiceKing 0.4.1. At this point the
+        // recording file is already open and has received a real audio buffer.
+        try? await Task.sleep(for: .milliseconds(120))
 
-            // A newer deep-link request may have arrived while the previous
-            // handoff was resolving. Process it only after the old transaction
-            // has fully completed.
-            if self.pendingKeyboardActivation != nil,
-               UIApplication.shared.applicationState == .active {
-                self.resolvePendingKeyboardActivationIfPossible()
+        if let returnBundleIdentifier,
+           !returnBundleIdentifier.isEmpty {
+            if !PreviousAppReturner.open(
+                bundleID: returnBundleIdentifier
+            ) {
+                lastError = "iOS blocked automatic return. Return manually."
+                markBridgeChanged()
             }
+        } else {
+            lastError = "Could not identify the previous app. Return manually."
+            markBridgeChanged()
         }
     }
 
@@ -478,12 +387,19 @@ final class AppModel: ObservableObject {
             return false
         }
 
-        // This method is the only place allowed to rebuild microphone input after
-        // a cold/background period. If the app is not fully active, park the
-        // request instead of attempting kAUStartIO from .inactive/.background.
+        // onOpenURL can arrive during the final inactive -> active transition.
+        // Give the same handoff a short chance to settle rather than creating a
+        // second pending state machine.
+        for _ in 0..<12 {
+            if UIApplication.shared.applicationState == .active {
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+
         guard UIApplication.shared.applicationState == .active else {
             publishBridgeError(
-                "TypeVoice is not foreground-active yet. Tap the microphone to try again.",
+                "TypeVoice is not foreground-active yet.",
                 requestID: requestID,
                 kind: .audioStartFailed,
                 retryAvailable: false,
@@ -506,40 +422,24 @@ final class AppModel: ObservableObject {
             return false
         }
 
-        // Establish a clean, ORDERED baseline. This is a barrier on the same
-        // serial AVAudioSession queue used by setActive(true), so an old delayed
-        // setActive(false) can never arrive after the new session has started.
         microphoneCapture.clearStandbyExpiry()
         microphoneCapture.shutdown()
         isServiceReady = false
         await audioSessionCoordinator.resetAndWait()
 
+        var retry = 0
         var finalError: Error?
 
-        // Let the host-app -> TypeVoice route transition settle before claiming
-        // the non-mixable recording session (which also pauses music).
-        try? await Task.sleep(for: .milliseconds(140))
-
-        for attempt in 0..<3 {
+        while true {
             guard !Task.isCancelled,
                   UIApplication.shared.applicationState == .active else {
                 return false
             }
 
-            if attempt > 0 {
-                microphoneCapture.shutdown()
-                        try? await Task.sleep(
-                    for: .milliseconds(160 + attempt * 100)
-                )
-            }
-
             do {
-                // Reassert the same profile; do not deactivate between retries.
-                // Repeated false/true toggles create another race with mediaserverd.
                 try await audioSessionCoordinator.beginAndReassert(
                     .backgroundKeepAlive
                 )
-
                 try await microphoneCapture.warmUp(
                     firstBufferTimeout: .milliseconds(1_800)
                 )
@@ -558,7 +458,17 @@ final class AppModel: ObservableObject {
             } catch {
                 finalError = error
                 microphoneCapture.shutdown()
-                        isServiceReady = false
+                isServiceReady = false
+
+                guard Self.isTransientAudioSessionError(error),
+                      retry < 4 else {
+                    break
+                }
+
+                retry += 1
+                try? await Task.sleep(
+                    for: .milliseconds(150 * retry)
+                )
             }
         }
 
@@ -566,7 +476,6 @@ final class AppModel: ObservableObject {
 
         let message = finalError?.localizedDescription
             ?? "Microphone activation failed."
-
         publishBridgeError(
             "Foreground microphone recovery failed: \(message)",
             requestID: requestID,
@@ -578,12 +487,15 @@ final class AppModel: ObservableObject {
         return false
     }
 
+    private static func isTransientAudioSessionError(
+        _ error: Error
+    ) -> Bool {
+        let code = (error as NSError).code
+        return code == 560_557_684 || code == 2_003_329_396
+    }
+
     func appBecameActive() {
         refreshAuthState()
-
-        if pendingKeyboardActivation != nil {
-            resolvePendingKeyboardActivationIfPossible()
-        }
     }
 
     /// Called when the user changes 10 s / 30 s / 1 min / 5 min in Settings.
