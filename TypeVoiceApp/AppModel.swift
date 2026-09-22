@@ -636,7 +636,13 @@ final class AppModel: ObservableObject {
             return
         }
 
-        let selected = TimeInterval(max(10, SharedStore.quickStandbySeconds))
+        let configuredSeconds = SharedStore.serviceStandbySeconds
+        if configuredSeconds < 0 {
+            microphoneCapture.clearStandbyExpiry()
+            return
+        }
+
+        let selected = TimeInterval(max(10, configuredSeconds))
         let elapsed = Date().timeIntervalSince(keyboardExitedAt)
         let remaining = selected - elapsed
 
