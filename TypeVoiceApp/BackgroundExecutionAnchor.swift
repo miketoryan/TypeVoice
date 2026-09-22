@@ -20,7 +20,7 @@ final class BackgroundExecutionAnchor {
         } else {
             newPlayer = try AVAudioPlayer(data: Self.silentWAVData)
             newPlayer.numberOfLoops = -1
-            newPlayer.volume = 0
+            newPlayer.volume = 1
             newPlayer.prepareToPlay()
             player = newPlayer
         }
@@ -62,17 +62,7 @@ final class BackgroundExecutionAnchor {
         data.appendLittleEndian(bitsPerSample)
         data.append(contentsOf: Array("data".utf8))
         data.appendLittleEndian(dataSize)
-
-        // Deliberately use real non-zero PCM instead of an all-zero file.
-        // The AVAudioPlayer itself is muted (volume = 0), so the user hears
-        // nothing, but iOS still has an actual decoded/rendered audio stream.
-        // This isolates whether 0.23 failed because an all-zero source was not
-        // treated as meaningful background playback.
-        let sampleCount = Int(sampleRate * seconds)
-        for index in 0..<sampleCount {
-            let sample: Int16 = (index & 1) == 0 ? 1024 : -1024
-            data.appendLittleEndian(sample)
-        }
+        data.append(Data(repeating: 0, count: Int(dataSize)))
 
         return data
     }()
