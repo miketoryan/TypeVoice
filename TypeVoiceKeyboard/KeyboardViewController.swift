@@ -61,6 +61,7 @@ final class KeyboardViewController: UIInputViewController {
     private var activationProbeTask: Task<Void, Never>?
     private var hostResolveTask: Task<Void, Never>?
     private var foregroundFallbackRequestID: String?
+    private var mainAppPongGeneration: UInt64 = 0
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -360,6 +361,11 @@ final class KeyboardViewController: UIInputViewController {
                 Task { @MainActor in
                     await self?.fetchState()
                 }
+            },
+            DarwinBus.observe(.mainAppPong) { [weak self] in
+                Task { @MainActor in
+                    self?.mainAppPongGeneration &+= 1
+                }
             }
         ]
     }
@@ -464,9 +470,9 @@ final class KeyboardViewController: UIInputViewController {
         }
     }
 
-    /// Typeless-style activation gate: never trust a cached "ready" label.
-    /// Probe the containing app immediately before every direct start. If the
-    /// service cannot answer quickly, foreground TypeVoice instead.
+    /// Typeless-style activation gate: use Darwin Ping/Pong for process
+    /// liveness instead of a short localhost HTTP request. Keyboard-extension
+    /// URLSession startup latency is variable and was causing false "cold" results.
     private func startRecordingRequest(
         requestID suppliedRequestID: String? = nil
     ) {
@@ -476,20 +482,8 @@ final class KeyboardViewController: UIInputViewController {
         activationProbeTask = Task { @MainActor [weak self] in
             guard let self else { return }
 
-            do {
-                let liveState = try await self.bridge.fetchState(
-                    timeoutInterval: 0.30
-                )
-                self.apply(liveState)
-
-                guard liveState.serviceReady,
-                      liveState.backgroundWakeReady else {
-                    self.launchTypeVoiceAndResumeRecording(
-                        requestID: requestID
-                    )
-                    return
-                }
-            } catch {
+            let alive = await self.pingMainApp()
+            guard alive else {
                 self.launchTypeVoiceAndResumeRecording(
                     requestID: requestID
                 )
@@ -505,6 +499,10 @@ final class KeyboardViewController: UIInputViewController {
             self.insertionScheduledForRequestID = nil
             self.foregroundFallbackRequestID = nil
 
+            // We deliberately do not require cached serviceReady/backgroundWakeReady
+            // here. A live main app gets the start command and returns authoritative
+            // state. If its ACTIVE service is unavailable, that response triggers
+            // the existing foreground recovery path.
             self.latestState = BridgeState(
                 serverID: self.latestState.serverID,
                 revision: self.latestState.revision &+ 1,
@@ -527,6 +525,35 @@ final class KeyboardViewController: UIInputViewController {
             self.refreshUI()
             self.sendCommand(.startRecording, requestID: requestID)
         }
+    }
+
+    /// Returns true only when the containing app answers a fresh Darwin ping.
+    /// The permanent .mainAppPong observer is installed while the keyboard is
+    /// visible, so this avoids per-tap observer setup races.
+    private func pingMainApp() async -> Bool {
+        let baseline = mainAppPongGeneration
+        DarwinBus.post(.pingMainApp)
+
+        let checkpoints: [UInt64] = [
+            40_000_000,
+            60_000_000,
+            80_000_000,
+            120_000_000
+        ]
+
+        for delay in checkpoints {
+            do {
+                try await Task.sleep(nanoseconds: delay)
+            } catch {
+                return false
+            }
+
+            if mainAppPongGeneration != baseline {
+                return true
+            }
+        }
+
+        return false
     }
 
     private func apply(_ state: BridgeState) {
@@ -610,8 +637,8 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func applyConnectionFailure() {
-        // Like VocaPhone's readiness lease: one missed local request is not
-        // enough to declare a warm background service dead.
+        // UI polling failures do not decide activation liveness. Direct activation uses
+        // Darwin Ping/Pong; this lease only prevents UI flicker on one missed poll.
         if bridgeLeaseIsFresh {
             return
         }
