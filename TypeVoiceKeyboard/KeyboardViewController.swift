@@ -579,7 +579,7 @@ final class KeyboardViewController: UIInputViewController {
         )
 
         if hostBundleID == nil {
-            resolveHostApplicationWithRetries()
+            resolveHostApplicationInAdvance()
         }
         refreshUI()
     }
