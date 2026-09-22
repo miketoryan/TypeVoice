@@ -55,6 +55,10 @@ final class AppModel: ObservableObject {
     private var darwinObservations: [DarwinObservation] = []
 
     init() {
+        microphoneCapture.onStandbyExpired = { [weak self] in
+            self?.expireWarmStandby()
+        }
+
         audioSessionCoordinator.onInterruptionBegan = { [weak self] in
             self?.audioInterruptionBegan()
         }
@@ -181,11 +185,8 @@ final class AppModel: ObservableObject {
         lastError = nil
     }
 
-    /// Arms a time-limited warm microphone session.
-    ///
-    /// The input AVAudioEngine and its tap are started once while TypeVoice is
-    /// foregrounded. During standby the tap keeps receiving buffers and discards
-    /// them. A separate silent output anchor protects background residency.
+    /// Enables keyboard dictation. Audio resources are still created only when
+    /// the keyboard foregrounds TypeVoice for a recording.
     func arm() async {
         guard authManager.isLoggedIn else {
             refreshAuthState()
@@ -518,16 +519,11 @@ final class AppModel: ObservableObject {
     /// The duration is always measured from the actual keyboard-exit timestamp,
     /// not from when this setting changes.
     func updateStandbyDuration() {
-        guard isServiceReady else { return }
-
-        if keyboardIsVisible {
-            keyboardExitedAt = nil
-            microphoneCapture.clearStandbyExpiry()
-        } else if keyboardHasBeenSeen || keyboardExitedAt != nil {
-            applyKeyboardExitDeadline()
-        } else {
-            microphoneCapture.clearStandbyExpiry()
+        guard isServiceReady,
+              !microphoneCapture.isRecording else {
+            return
         }
+        scheduleMicrophoneStandby()
     }
 
     private var backgroundWakeReady: Bool {
@@ -535,55 +531,39 @@ final class AppModel: ObservableObject {
         return microphoneCapture.isWarmReady
     }
 
-    /// Applies the exact selected deadline from the moment the keyboard left.
-    /// If a recording is still active, keep the timestamp but defer teardown;
-    /// stop/cancel will call this again and use the remaining time.
-    private func applyKeyboardExitDeadline() {
-        guard isServiceReady else { return }
-
-        guard !keyboardIsVisible,
-              let keyboardExitedAt else {
-            microphoneCapture.clearStandbyExpiry()
+    /// Starts the short microphone warm window after a recording finishes.
+    /// 0 seconds means release immediately; otherwise the live input engine keeps
+    /// the app responsive for a direct second dictation until this timer expires.
+    private func scheduleMicrophoneStandby() {
+        guard isServiceReady,
+              microphoneCapture.isWarmReady,
+              !microphoneCapture.isRecording else {
             return
         }
 
-        if microphoneCapture.isRecording {
-            microphoneCapture.clearStandbyExpiry()
-            return
-        }
-
-        let configuredSeconds = SharedStore.serviceStandbySeconds
-        if configuredSeconds < 0 {
-            microphoneCapture.clearStandbyExpiry()
-            return
-        }
-
-        let selected = TimeInterval(max(10, configuredSeconds))
-        let elapsed = Date().timeIntervalSince(keyboardExitedAt)
-        let remaining = selected - elapsed
-
-        guard remaining > 0 else {
+        let seconds = SharedStore.serviceStandbySeconds
+        guard seconds > 0 else {
             expireWarmStandby()
             return
         }
 
-        microphoneCapture.setStandbyExpiry(after: remaining)
-    }
+        microphoneCapture.setStandbyExpiry(after: TimeInterval(seconds))
+        bridgeAudioStage = .standbySessionReady
 
-    /// Called when the containing app itself leaves the foreground without a
-    /// visible TypeVoice keyboard. This prevents a manually warmed session from
-    /// staying hot forever merely because no keyboardHidden event occurred.
-    func appEnteredBackground() {
-        guard isServiceReady, !keyboardIsVisible else { return }
-
-        if keyboardExitedAt == nil {
-            keyboardExitedAt = Date()
+        if bridgeStatus == .idle || bridgeStatus == .completed {
+            status = .ready
         }
-        applyKeyboardExitDeadline()
+
+        markBridgeChanged()
+        DarwinBus.post(.serviceChanged)
     }
 
-    /// Releases only the warm audio resources. Ongoing transcription/result
-    /// delivery is left intact, so a short standby choice never loses text.
+    func appEnteredBackground() {
+        // Recording or the explicit short standby input engine owns background
+        // execution. Do not create or extend a standby window merely because the
+        // app moved to the background.
+    }
+
     private func expireWarmStandby() {
         guard isServiceReady,
               !microphoneCapture.isRecording else {
@@ -671,16 +651,10 @@ final class AppModel: ObservableObject {
             keyboardHasBeenSeen = true
             keyboardExitedAt = nil
 
-            // While the TypeVoice keyboard is visible there is no standby
-            // countdown. The selected 10s/30s/1m/5m window starts only when the
-            // keyboard actually disappears.
-            microphoneCapture.clearStandbyExpiry()
-
         case .keyboardHidden:
             keyboardIsVisible = false
             keyboardHasBeenSeen = true
             keyboardExitedAt = Date()
-            applyKeyboardExitDeadline()
             DarwinBus.post(.serviceChanged)
 
         default:
@@ -820,11 +794,7 @@ final class AppModel: ObservableObject {
                   !Task.isCancelled else {
                 microphoneCapture.discardRecording()
                 try? await audioSessionCoordinator.endAndWait(.capture)
-                if keyboardIsVisible {
-                    microphoneCapture.clearStandbyExpiry()
-                } else {
-                    applyKeyboardExitDeadline()
-                }
+                scheduleMicrophoneStandby()
                 return false
             }
 
@@ -844,11 +814,7 @@ final class AppModel: ObservableObject {
             microphoneCapture.discardRecording()
             try? await audioSessionCoordinator.endAndWait(.capture)
             if backgroundWakeReady {
-                if keyboardIsVisible {
-                    microphoneCapture.clearStandbyExpiry()
-                } else {
-                    applyKeyboardExitDeadline()
-                }
+                scheduleMicrophoneStandby()
             }
 
             guard activeRequestID == requestID else { return false }
@@ -893,9 +859,7 @@ final class AppModel: ObservableObject {
         }
 
         try? await audioSessionCoordinator.endAndWait(.capture)
-        microphoneCapture.shutdown(removeRecording: false)
-        audioSessionCoordinator.reset()
-        isServiceReady = false
+        scheduleMicrophoneStandby()
 
         discardPreservedAudio()
         preservedAudioURL = fileURL
@@ -965,23 +929,20 @@ final class AppModel: ObservableObject {
             try? await audioSessionCoordinator.endAndWait(.capture)
         }
 
-        if backgroundWakeReady {
-            if keyboardIsVisible {
-                microphoneCapture.clearStandbyExpiry()
-            } else {
-                applyKeyboardExitDeadline()
-            }
-        }
-
         discardPreservedAudio()
         endProcessingBackgroundTask()
-        microphoneCapture.shutdown(removeRecording: false)
-        audioSessionCoordinator.reset()
-        isServiceReady = false
+
+        if backgroundWakeReady {
+            scheduleMicrophoneStandby()
+        } else {
+            microphoneCapture.shutdown(removeRecording: false)
+            audioSessionCoordinator.reset()
+            isServiceReady = false
+        }
 
         resetBridgeToIdle(clearRequest: false)
-        bridgeAudioStage = .idle
-        status = .idle
+        bridgeAudioStage = isServiceReady ? .standbySessionReady : .idle
+        status = isServiceReady ? .ready : .idle
         lastError = nil
         markBridgeChanged()
     }
@@ -1054,26 +1015,32 @@ final class AppModel: ObservableObject {
             }
 
             lastTranscript = raw
-            bridgeStatus = .polishing
-            bridgeAudioStage = .polishing
-            bridgeFailureKind = nil
-            bridgeRetryAvailable = false
-            status = .polishing
-            markBridgeChanged()
 
             let finalText: String
-            do {
-                finalText = try await client.cleanup(raw)
-            } catch {
-                guard !Task.isCancelled,
-                      activeRequestID == requestID else {
-                    return
-                }
+            if SharedStore.cleanupEnabled {
+                bridgeStatus = .polishing
+                bridgeAudioStage = .polishing
+                bridgeFailureKind = nil
+                bridgeRetryAvailable = false
+                status = .polishing
+                markBridgeChanged()
 
-                // Cleanup is optional. Recognition already succeeded, so do not
-                // strand the user in an error state if style cleanup fails.
+                do {
+                    finalText = try await client.cleanup(raw)
+                } catch {
+                    guard !Task.isCancelled,
+                          activeRequestID == requestID else {
+                        return
+                    }
+
+                    // Cleanup is optional. Recognition already succeeded, so do not
+                    // strand the user if the cleanup request itself fails.
+                    finalText = raw
+                    lastError = "Cleanup failed; raw transcript will be inserted. \(error.localizedDescription)"
+                }
+            } else {
+                // VoiceKing-style raw transcription path: no second model call.
                 finalText = raw
-                lastError = "Cleanup failed; raw transcript will be inserted. \(error.localizedDescription)"
             }
 
             guard !Task.isCancelled,
@@ -1185,11 +1152,9 @@ final class AppModel: ObservableObject {
 
         deletePreservedAudio(ifMatches: activeRequestID)
         endProcessingBackgroundTask()
-        microphoneCapture.shutdown(removeRecording: false)
-        audioSessionCoordinator.reset()
-        isServiceReady = false
         resetBridgeToIdle(clearRequest: true)
-        status = .idle
+        bridgeAudioStage = isServiceReady ? .standbySessionReady : .idle
+        status = isServiceReady ? .ready : .idle
         markBridgeChanged()
     }
 
