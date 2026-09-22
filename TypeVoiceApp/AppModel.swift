@@ -121,7 +121,6 @@ final class AppModel: ObservableObject {
         recordingStartTask?.cancel()
         foregroundWarmupTask?.cancel()
         activationResolutionTask?.cancel()
-        endProcessingBackgroundTask()
         darwinObservations.removeAll()
         localBridge.stop()
     }
