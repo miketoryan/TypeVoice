@@ -709,6 +709,7 @@ final class AppModel: ObservableObject {
         darwinObservations.removeAll()
 
         let events: [DarwinEvent] = [
+            .pingMainApp,
             .keyboardVisible,
             .keyboardHidden,
             .startRecording,
@@ -731,9 +732,17 @@ final class AppModel: ObservableObject {
     /// Receiving this callback is intentionally cheap so the listener can accept
     /// the HTTP command immediately afterwards.
     private func handleDarwinWake(_ event: DarwinEvent) {
+        // Typeless-style liveness probe. Reply before consulting cached service
+        // state so the keyboard can distinguish "main app process is alive" from
+        // "voice service is ready".
+        if event == .pingMainApp {
+            DarwinBus.post(.mainAppPong)
+            return
+        }
+
         guard isServiceReady else { return }
 
-        // Only live microphone flow decides whether the warm capture path is
+        // Only current service state decides whether the ACTIVE path is usable.
         // usable. The silent output anchor is a residency aid and can be
         // restarted independently without touching microphone IO.
         if !backgroundWakeReady {
