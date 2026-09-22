@@ -22,6 +22,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var chatGPTAccountSummary: String?
 
     private let audioSessionCoordinator = AudioSessionCoordinator()
+    private let backgroundAnchor = BackgroundExecutionAnchor()
     private let microphoneCapture = MicrophoneCapture()
     private let authManager = ChatGPTAuthManager()
     private let localBridge = LocalBridgeServer()
@@ -64,8 +65,9 @@ final class AppModel: ObservableObject {
 
         audioSessionCoordinator.onInterruptionEnded = { [weak self] in
             guard let self else { return }
-            // The ACTIVE service is never rebuilt from background after an interruption.
-            // The next keyboard activation may foreground TypeVoice and rebuild it.
+            // Microphone input is never restarted from the background. Once an
+            // interruption has torn down the warm input graph, the next keyboard
+            // activation may foreground TypeVoice and rebuild it there.
             self.markBridgeChanged()
             DarwinBus.post(.serviceChanged)
         }
@@ -75,6 +77,7 @@ final class AppModel: ObservableObject {
             Task { @MainActor in
                 let interruptedRequestID = self.activeRequestID
                 self.microphoneCapture.shutdown()
+                self.backgroundAnchor.stop()
                 self.audioSessionCoordinator.reset()
                 self.isServiceReady = false
                 self.bridgeAudioStage = .failed
@@ -103,6 +106,12 @@ final class AppModel: ObservableObject {
             // Route changes can stop silent playback while leaving the input
             // engine alive. Re-start only the output keep-alive here; microphone
             // IO is never rebuilt from a background lifecycle callback.
+            if self.isServiceReady,
+               self.microphoneCapture.isWarmReady,
+               !self.backgroundAnchor.isRunning {
+                try? self.backgroundAnchor.start()
+            }
+
             self.markBridgeChanged()
         }
 
@@ -187,10 +196,11 @@ final class AppModel: ObservableObject {
         lastError = nil
     }
 
-    /// Arms a time-limited ACTIVE audio service.
+    /// Arms a time-limited warm microphone session.
     ///
-    /// A foreground-created output-side serviceEngine remains running in standby.
-    /// Actual dictation creates a separate short-lived microphone engine.
+    /// The input AVAudioEngine and its tap are started once while TypeVoice is
+    /// foregrounded. During standby the tap keeps receiving buffers and discards
+    /// them. A separate silent output anchor protects background residency.
     func arm() async {
         guard authManager.isLoggedIn else {
             refreshAuthState()
@@ -218,6 +228,8 @@ final class AppModel: ObservableObject {
         do {
             try await audioSessionCoordinator.beginAndWait(.backgroundKeepAlive)
             try await microphoneCapture.warmUp()
+            try backgroundAnchor.start()
+
             isQuickDictationEnabled = true
             SharedStore.quickDictationEnabled = true
             isServiceReady = true
@@ -231,6 +243,7 @@ final class AppModel: ObservableObject {
             DarwinBus.post(.serviceChanged)
         } catch {
             microphoneCapture.shutdown()
+            backgroundAnchor.stop()
             await audioSessionCoordinator.resetAndWait()
             publishBridgeError(
                 error.localizedDescription,
@@ -255,6 +268,7 @@ final class AppModel: ObservableObject {
         pendingKeyboardActivation = nil
 
         microphoneCapture.shutdown()
+        backgroundAnchor.stop()
         audioSessionCoordinator.reset()
         discardPreservedAudio()
 
@@ -338,6 +352,12 @@ final class AppModel: ObservableObject {
             let audioReady: Bool
             if self.backgroundWakeReady {
                 self.microphoneCapture.clearStandbyExpiry()
+
+                // The output anchor protects residency but is not part of audio
+                // capture readiness. Best-effort restart if a route change stopped it.
+                if !self.backgroundAnchor.isRunning {
+                    try? self.backgroundAnchor.start()
+                }
                 audioReady = true
             } else {
                 audioReady = await self.ensureForegroundWarmSession(
@@ -390,6 +410,9 @@ final class AppModel: ObservableObject {
     ) async -> Bool {
         if backgroundWakeReady {
             microphoneCapture.clearStandbyExpiry()
+            if !backgroundAnchor.isRunning {
+                try? backgroundAnchor.start()
+            }
             return true
         }
 
@@ -458,10 +481,12 @@ final class AppModel: ObservableObject {
             return false
         }
 
-        // Establish a clean foreground baseline for the ACTIVE service layer.
-        // Capture uses a separate short-lived AVAudioEngine after this succeeds.
+        // Establish a clean, ORDERED baseline. This is a barrier on the same
+        // serial AVAudioSession queue used by setActive(true), so an old delayed
+        // setActive(false) can never arrive after the new session has started.
         microphoneCapture.clearStandbyExpiry()
         microphoneCapture.shutdown()
+        backgroundAnchor.stop()
         isServiceReady = false
         await audioSessionCoordinator.resetAndWait()
 
@@ -479,6 +504,7 @@ final class AppModel: ObservableObject {
 
             if attempt > 0 {
                 microphoneCapture.shutdown()
+                backgroundAnchor.stop()
                 try? await Task.sleep(
                     for: .milliseconds(160 + attempt * 100)
                 )
@@ -494,6 +520,8 @@ final class AppModel: ObservableObject {
                 try await microphoneCapture.warmUp(
                     firstBufferTimeout: .milliseconds(1_800)
                 )
+                try backgroundAnchor.start()
+
                 isServiceReady = true
                 status = .ready
                 bridgeAudioStage = .standbySessionReady
@@ -508,6 +536,7 @@ final class AppModel: ObservableObject {
             } catch {
                 finalError = error
                 microphoneCapture.shutdown()
+                backgroundAnchor.stop()
                 isServiceReady = false
             }
         }
@@ -550,6 +579,10 @@ final class AppModel: ObservableObject {
         guard isServiceReady,
               !backgroundWakeReady,
               !microphoneCapture.isRecording else {
+            if microphoneCapture.isWarmReady,
+               !backgroundAnchor.isRunning {
+                try? backgroundAnchor.start()
+            }
             return
         }
 
@@ -643,6 +676,7 @@ final class AppModel: ObservableObject {
 
         microphoneCapture.clearStandbyExpiry()
         microphoneCapture.shutdown(removeRecording: false)
+        backgroundAnchor.stop()
         audioSessionCoordinator.reset()
         isServiceReady = false
 
@@ -708,8 +742,9 @@ final class AppModel: ObservableObject {
 
         guard isServiceReady else { return }
 
-        // Only the foreground-created serviceEngine decides whether the ACTIVE
-        // path is usable. The microphone capture engine is independent.
+        // Only current service state decides whether the ACTIVE path is usable.
+        // usable. The silent output anchor is a residency aid and can be
+        // restarted independently without touching microphone IO.
         if !backgroundWakeReady {
             bridgeAudioStage = .failed
             markBridgeChanged()
@@ -726,8 +761,14 @@ final class AppModel: ObservableObject {
             // keyboard actually disappears.
             microphoneCapture.clearStandbyExpiry()
 
-            // No AVAudioPlayer anchor exists in this experiment. The serviceEngine is
-            // the only ACTIVE residency layer; microphone capture is separate.
+            // Silent playback is only a finite-window residency aid. Restart it
+            // independently if a route change stopped it; never rebuild mic IO
+            // from this background/Darwin callback.
+            if microphoneCapture.isWarmReady,
+               !backgroundAnchor.isRunning {
+                try? backgroundAnchor.start()
+            }
+
         case .keyboardHidden:
             keyboardIsVisible = false
             keyboardHasBeenSeen = true
@@ -861,8 +902,8 @@ final class AppModel: ObservableObject {
             bridgeAudioStage = .captureSessionReady
             markBridgeChanged()
 
-            // Hot path: the ACTIVE service engine is already running. Start a separate
-            // short-lived microphone engine without touching the service engine.
+            // Hot path: the input tap and engine are already running. Starting a
+            // dictation only opens the file gate; no audio IO is started here.
             bridgeAudioStage = .startingInput
             markBridgeChanged()
             _ = try await microphoneCapture.startRecording()
@@ -926,8 +967,8 @@ final class AppModel: ObservableObject {
             return
         }
 
-        // Close and destroy only the short-lived capture engine. The separate
-        // ACTIVE service engine remains running for the next keyboard request.
+        // Close only the recording file gate. The persistent input tap stays
+        // alive and idle buffers are discarded during the configured ready window.
         bridgeAudioStage = .returningToStandby
         markBridgeChanged()
 
@@ -1048,9 +1089,11 @@ final class AppModel: ObservableObject {
         recordingStartRequestID = nil
         microphoneCapture.clearStandbyExpiry()
 
-        // Once iOS tears down the ACTIVE service we do not rebuild it from
-        // background. The next keyboard activation may foreground TypeVoice.
+        // Once iOS tears down microphone IO we deliberately do not restart it
+        // from the background. Mark the warm service cold; the next keyboard
+        // activation may foreground TypeVoice and warm it again.
         microphoneCapture.shutdown()
+        backgroundAnchor.stop()
         audioSessionCoordinator.reset()
         isServiceReady = false
 
