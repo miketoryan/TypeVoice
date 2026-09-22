@@ -6,9 +6,6 @@ struct ContentView: View {
     @AppStorage(SharedKeys.interfaceLanguage, store: SharedStore.defaults)
     private var languageRaw = TypeVoiceLanguage.chinese.rawValue
 
-    @AppStorage(SharedKeys.serviceStandbySeconds, store: SharedStore.defaults)
-    private var quickStandbySeconds = 43_200
-
     private var isChinese: Bool {
         languageRaw != TypeVoiceLanguage.english.rawValue
     }
@@ -103,13 +100,6 @@ struct ContentView: View {
                             }
                         }
 
-                        if model.isQuickDictationEnabled && !model.isServiceReady {
-                            Button {
-                                Task { await model.arm() }
-                            } label: {
-                                Text(text("立即激活麦克风", "Activate Microphone Now"))
-                            }
-                        }
                     }
                     .disabled(
                         !model.isChatGPTLoggedIn
@@ -121,8 +111,8 @@ struct ContentView: View {
                     Text(text("语音服务", "Voice service"))
                 } footer: {
                     Text(text(
-                        "快速语音现在采用 ACTIVE 语音服务待命：待命时不保持麦克风输入，只有真正开始说话时才开启麦克风。键盘每次都会先确认后台服务是否仍能响应；如果服务不可用或 iOS 拒绝后台开启输入，会自动短暂打开 TypeVoice 恢复后再返回输入框。",
-                        "Quick Dictation now keeps an ACTIVE voice service ready without holding microphone input open. The microphone is opened only for an actual dictation. Every keyboard activation verifies that the service still responds; if it is unavailable or iOS rejects background input, TypeVoice briefly opens to recover and returns automatically."
+                        "当前采用稳定的跳转激活模式：点击键盘麦克风后，TypeVoice 会短暂打开，在前台启动麦克风后自动返回原输入框。未录音时不保持后台音频或麦克风。",
+                        "The current stable mode uses foreground handoff: tapping the keyboard microphone briefly opens TypeVoice, starts microphone capture in the foreground, then returns automatically. No idle background audio or microphone is kept running."
                     ))
                 }
 
@@ -132,15 +122,6 @@ struct ContentView: View {
                         Text("English").tag(TypeVoiceLanguage.english.rawValue)
                     }
 
-                    Picker(text("语音服务待命时间", "Voice service standby"), selection: $quickStandbySeconds) {
-                        Text(text("5 分钟", "5 minutes")).tag(300)
-                        Text(text("1 小时", "1 hour")).tag(3_600)
-                        Text(text("12 小时", "12 hours")).tag(43_200)
-                        Text(text("不自动关闭", "Never")).tag(-1)
-                    }
-                    .onChange(of: quickStandbySeconds) { _ in
-                        model.updateStandbyDuration()
-                    }
                 } header: {
                     Text(text("使用设置", "Usage"))
                 } footer: {
@@ -201,13 +182,13 @@ struct ContentView: View {
             return text("未开启", "Disabled")
         }
 
-        if !model.isServiceReady, model.status == .idle {
-            return text("冷待命", "Cold standby")
+        if model.status == .idle {
+            return text("跳转待命", "Handoff ready")
         }
 
         switch model.status {
         case .idle:
-            return text("冷待命", "Cold standby")
+            return text("跳转待命", "Handoff ready")
         case .ready:
             return text("已待命", "Ready")
         case .starting:
@@ -230,8 +211,8 @@ struct ContentView: View {
 
         if !model.isQuickDictationEnabled {
             return text(
-                "开启后，后台语音服务保持待命，麦克风只在说话时开启。",
-                "Enable Quick Dictation to keep the voice service ready; the microphone opens only while you speak."
+                "开启后，键盘会在每次开始录音时短暂打开 TypeVoice。",
+                "When enabled, the keyboard briefly opens TypeVoice each time a new recording starts."
             )
         }
 
@@ -242,13 +223,13 @@ struct ContentView: View {
             return text("完成后会自动插入当前输入框。", "The result will be inserted automatically.")
         case .ready:
             return text(
-                "语音服务已待命；当前没有录音时麦克风保持关闭。",
-                "Voice service is ready; the microphone stays off while you are not recording."
+                "正在准备本次录音。",
+                "Preparing this recording."
             )
         case .idle:
             return text(
-                "快速语音仍然开启，但后台服务已结束；下次从键盘使用时会短暂打开 TypeVoice 重新激活。",
-                "Quick Dictation is still enabled, but the background service has ended. The next keyboard use may briefly open TypeVoice to reactivate it."
+                "未录音时不保持后台音频；下次点击键盘麦克风会自动跳转、启动并返回。",
+                "No idle background audio is kept running. The next keyboard tap will hand off to TypeVoice, start capture, and return automatically."
             )
         default:
             return text("快速语音已开启。", "Quick Dictation is enabled.")
