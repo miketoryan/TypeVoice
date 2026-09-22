@@ -6,6 +6,12 @@ struct ContentView: View {
     @AppStorage(SharedKeys.interfaceLanguage, store: SharedStore.defaults)
     private var languageRaw = TypeVoiceLanguage.chinese.rawValue
 
+    @AppStorage(SharedKeys.serviceStandbySeconds, store: SharedStore.defaults)
+    private var standbySeconds = 10
+
+    @AppStorage(SharedKeys.cleanupEnabled, store: SharedStore.defaults)
+    private var cleanupEnabled = true
+
     private var isChinese: Bool {
         languageRaw != TypeVoiceLanguage.english.rawValue
     }
@@ -111,8 +117,8 @@ struct ContentView: View {
                     Text(text("语音服务", "Voice service"))
                 } footer: {
                     Text(text(
-                        "当前采用稳定的跳转激活模式：点击键盘麦克风后，TypeVoice 会短暂打开，在前台启动麦克风后自动返回原输入框。未录音时不保持后台音频或麦克风。",
-                        "The current stable mode uses foreground handoff: tapping the keyboard microphone briefly opens TypeVoice, starts microphone capture in the foreground, then returns automatically. No idle background audio or microphone is kept running."
+                        "首次或待命结束后采用稳定的跳转激活：TypeVoice 短暂打开并自动返回。录音结束后，麦克风可按设置继续待命 0–5 分钟；待命期间再次录音无需跳转。",
+                        "First use, or use after standby expires, uses the stable foreground handoff and returns automatically. After recording, the microphone can remain warm for the selected 0–5 minutes; another recording during that window starts without a handoff."
                     ))
                 }
 
@@ -122,12 +128,27 @@ struct ContentView: View {
                         Text("English").tag(TypeVoiceLanguage.english.rawValue)
                     }
 
+                    Picker(text("麦克风待命时间", "Microphone standby"), selection: $standbySeconds) {
+                        Text(text("0 秒", "0 seconds")).tag(0)
+                        Text(text("10 秒", "10 seconds")).tag(10)
+                        Text(text("30 秒", "30 seconds")).tag(30)
+                        Text(text("1 分钟", "1 minute")).tag(60)
+                        Text(text("5 分钟", "5 minutes")).tag(300)
+                    }
+                    .onChange(of: standbySeconds) { _ in
+                        model.updateStandbyDuration()
+                    }
+
+                    Toggle(
+                        text("语音识别后自动整理", "Auto-clean after transcription"),
+                        isOn: $cleanupEnabled
+                    )
                 } header: {
                     Text(text("使用设置", "Usage"))
                 } footer: {
                     Text(text(
-                        "这里的中文/English 只控制界面显示，不控制识别语言。语音识别自动判断中文、英文或中英混说。",
-                        "This Chinese/English option only changes the interface. Speech language is detected automatically, including mixed Chinese and English."
+                        "界面语言不影响语音识别语言。麦克风待命期间可直接再次录音；待命结束后仍使用跳转激活。自动整理默认开启，关闭后直接插入原始语音识别结果，不再调用二次整理模型。",
+                        "Interface language does not affect speech recognition. During microphone standby, another recording can start directly; after standby expires, TypeVoice uses foreground handoff. Auto-clean is on by default; when off, the raw transcription is inserted without a second cleanup model call."
                     ))
                 }
 
@@ -223,8 +244,8 @@ struct ContentView: View {
             return text("完成后会自动插入当前输入框。", "The result will be inserted automatically.")
         case .ready:
             return text(
-                "正在准备本次录音。",
-                "Preparing this recording."
+                "麦克风正在短时待命；再次点击可直接录音。",
+                "Microphone is in short standby; tap again to record directly."
             )
         case .idle:
             return text(
