@@ -58,10 +58,8 @@ final class KeyboardViewController: UIInputViewController {
 
     private var pollingTask: Task<Void, Never>?
     private var commandTask: Task<Void, Never>?
-    private var activationProbeTask: Task<Void, Never>?
     private var hostResolveTask: Task<Void, Never>?
     private var foregroundFallbackRequestID: String?
-    private var mainAppPongGeneration: UInt64 = 0
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -90,8 +88,6 @@ final class KeyboardViewController: UIInputViewController {
         mayAutoInsert = false
         insertionScheduledForRequestID = nil
         stopBridgeTasks()
-        activationProbeTask?.cancel()
-        activationProbeTask = nil
         darwinObservations.removeAll()
         hostResolveTask?.cancel()
         hostResolveTask = nil
@@ -108,7 +104,6 @@ final class KeyboardViewController: UIInputViewController {
         }
         pollingTask?.cancel()
         commandTask?.cancel()
-        activationProbeTask?.cancel()
         hostResolveTask?.cancel()
         darwinObservations.removeAll()
     }
@@ -164,23 +159,15 @@ final class KeyboardViewController: UIInputViewController {
                 )
             } else if latestState.failureKind == .authRequired {
                 openTypeVoiceForAccountRecovery()
-            } else if latestState.serviceReady,
-                      latestState.backgroundWakeReady {
-                startRecordingRequest()
             } else {
                 launchTypeVoiceAndResumeRecording()
             }
 
         default:
-            // VoiceKing v0.3.9 rule:
-            // ACTIVE service -> record in-place after a live probe;
-            // unavailable service -> foreground TypeVoice immediately.
-            if latestState.serviceReady,
-               latestState.backgroundWakeReady {
-                startRecordingRequest()
-            } else {
-                launchTypeVoiceAndResumeRecording()
-            }
+            // Stable jump-first rule: starting a new dictation always foregrounds
+            // TypeVoice once, starts microphone IO there, then returns to the host.
+            // Do not spend time probing a background service that is not relied on.
+            launchTypeVoiceAndResumeRecording()
         }
     }
 
@@ -361,11 +348,6 @@ final class KeyboardViewController: UIInputViewController {
                 Task { @MainActor in
                     await self?.fetchState()
                 }
-            },
-            DarwinBus.observe(.mainAppPong) { [weak self] in
-                Task { @MainActor in
-                    self?.mainAppPongGeneration &+= 1
-                }
             }
         ]
     }
@@ -470,92 +452,6 @@ final class KeyboardViewController: UIInputViewController {
         }
     }
 
-    /// Typeless-style activation gate: use Darwin Ping/Pong for process
-    /// liveness instead of a short localhost HTTP request. Keyboard-extension
-    /// URLSession startup latency is variable and was causing false "cold" results.
-    private func startRecordingRequest(
-        requestID suppliedRequestID: String? = nil
-    ) {
-        let requestID = suppliedRequestID ?? UUID().uuidString
-
-        activationProbeTask?.cancel()
-        activationProbeTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-
-            let alive = await self.pingMainApp()
-            guard alive else {
-                self.launchTypeVoiceAndResumeRecording(
-                    requestID: requestID
-                )
-                return
-            }
-
-            guard self.pendingForegroundRecordingRequestID == nil else {
-                return
-            }
-
-            self.currentRequestID = requestID
-            self.mayAutoInsert = true
-            self.insertionScheduledForRequestID = nil
-            self.foregroundFallbackRequestID = nil
-
-            // We deliberately do not require cached serviceReady/backgroundWakeReady
-            // here. A live main app gets the start command and returns authoritative
-            // state. If its ACTIVE service is unavailable, that response triggers
-            // the existing foreground recovery path.
-            self.latestState = BridgeState(
-                serverID: self.latestState.serverID,
-                revision: self.latestState.revision &+ 1,
-                serviceReady: self.latestState.serviceReady,
-                quickDictationEnabled: self.latestState.quickDictationEnabled,
-                backgroundWakeReady: self.latestState.backgroundWakeReady,
-                microphoneReady: false,
-                requestClaimed: false,
-                audioStage: .claimed,
-                status: .starting,
-                failureKind: nil,
-                retryAvailable: false,
-                requestID: requestID,
-                transcribedText: nil,
-                resultCreatedAt: nil,
-                lastError: nil,
-                interfaceLanguage: self.latestState.interfaceLanguage
-            )
-
-            self.refreshUI()
-            self.sendCommand(.startRecording, requestID: requestID)
-        }
-    }
-
-    /// Returns true only when the containing app answers a fresh Darwin ping.
-    /// The permanent .mainAppPong observer is installed while the keyboard is
-    /// visible, so this avoids per-tap observer setup races.
-    private func pingMainApp() async -> Bool {
-        let baseline = mainAppPongGeneration
-        DarwinBus.post(.pingMainApp)
-
-        let checkpoints: [UInt64] = [
-            40_000_000,
-            60_000_000,
-            80_000_000,
-            120_000_000
-        ]
-
-        for delay in checkpoints {
-            do {
-                try await Task.sleep(nanoseconds: delay)
-            } catch {
-                return false
-            }
-
-            if mainAppPongGeneration != baseline {
-                return true
-            }
-        }
-
-        return false
-    }
-
     private func apply(_ state: BridgeState) {
         lastBridgeSuccessAt = Date()
 
@@ -586,12 +482,6 @@ final class KeyboardViewController: UIInputViewController {
                state.requestID == pendingRequestID {
                 pendingForegroundRecordingRequestID = nil
                 mayAutoInsert = true
-            } else if state.status == .idle,
-                      state.serviceReady,
-                      state.backgroundWakeReady {
-                pendingForegroundRecordingRequestID = nil
-                startRecordingRequest(requestID: pendingRequestID)
-                return
             } else if state.status == .error,
                       state.requestID == pendingRequestID {
                 pendingForegroundRecordingRequestID = nil
@@ -637,8 +527,8 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func applyConnectionFailure() {
-        // UI polling failures do not decide activation liveness. Direct activation uses
-        // Darwin Ping/Pong; this lease only prevents UI flicker on one missed poll.
+        // UI polling is only for state/result delivery. New recordings use the
+        // deterministic foreground handoff, so one missed poll must not disturb UI.
         if bridgeLeaseIsFresh {
             return
         }
@@ -724,17 +614,10 @@ final class KeyboardViewController: UIInputViewController {
                     "快速语音未开启 · 点击会打开 TypeVoice",
                     "Quick Dictation is off · tap to open TypeVoice"
                 )
-            } else if latestState.serviceReady,
-                      latestState.backgroundWakeReady,
-                      bridgeLeaseIsFresh {
-                statusLabel.text = localized(
-                    "语音服务已待命 · 点击直接说话",
-                    "Voice service ready · tap to speak"
-                )
             } else {
                 statusLabel.text = localized(
-                    "语音服务未激活 · 点击自动打开 TypeVoice",
-                    "Voice service inactive · tap to open TypeVoice automatically"
+                    "点击后短暂打开 TypeVoice 并自动返回",
+                    "Tap to briefly open TypeVoice and return automatically"
                 )
             }
             micButton.setTitle(
