@@ -5,37 +5,44 @@ import Foundation
 final class MicrophoneCapture {
     private let lock = NSLock()
 
+    /// One long-lived AVAudioEngine for both ACTIVE standby and RECORDING.
+    ///
+    /// ACTIVE:
+    /// - engine is running
+    /// - output graph is alive
+    /// - no microphone tap is installed
+    ///
+    /// RECORDING:
+    /// - the SAME engine stays running
+    /// - an input tap is temporarily installed
+    ///
+    /// This is the key Typeless-style experiment: release microphone input
+    /// without stopping the audio engine that owns the background audio service.
     private var engine: AVAudioEngine?
+    private var servicePrepared = false
+
     private var recordingFile: AVAudioFile?
     private var recordingURL: URL?
-    private var tapInstalled = false
+    private var inputTapInstalled = false
     private var receivedRecordingBuffer = false
-
-    /// ACTIVE service state. This deliberately does NOT mean that microphone
-    /// input is running. TypeVoice prepares the service while foregrounded,
-    /// keeps the background audio service alive, and only opens microphone IO
-    /// for an actual dictation.
-    private var servicePrepared = false
 
     private var standbyGeneration: UInt64 = 0
     private var standbyTask: Task<Void, Never>?
 
     var onStandbyExpired: (() -> Void)?
 
-    /// True only while one dictation is actively capturing microphone buffers.
     var isActive: Bool {
-        isRecording && isEngineRunning
+        isRecording && isEngineRunning && inputTapInstalled
     }
 
-    /// Compatibility name used by the rest of the app. In the ACTIVE-service
-    /// architecture this means "the foreground-prepared voice service is ready",
-    /// not "the microphone is currently open".
+    /// "Warm" now means the long-lived output-side engine is still running.
+    /// It does NOT mean microphone input is open.
     var isWarmReady: Bool {
-        servicePrepared
+        servicePrepared && engine?.isRunning == true
     }
 
     var isStandbyReady: Bool {
-        servicePrepared && !isRecording
+        isWarmReady && !isRecording && !inputTapInstalled
     }
 
     var isEngineRunning: Bool {
@@ -60,11 +67,12 @@ final class MicrophoneCapture {
         }
     }
 
-    /// Prepare the ACTIVE service without touching microphone input.
+    /// Build and start the long-lived output-side engine while TypeVoice is
+    /// foreground-active. Deliberately do NOT touch engine.inputNode here.
     ///
-    /// The containing app has already activated AVAudioSession and started its
-    /// background audio anchor before calling this method. No AVAudioEngine input
-    /// node or tap is started here, so the microphone privacy indicator remains off.
+    /// Accessing mainMixerNode creates the default mixer -> outputNode path.
+    /// With no source/input connected the graph renders silence, but the engine
+    /// itself remains running under the app's audio background mode.
     func warmUp(
         firstBufferTimeout: Duration = .milliseconds(900)
     ) async throws {
@@ -72,17 +80,40 @@ final class MicrophoneCapture {
             throw MicrophoneCaptureError.alreadyRecording
         }
 
-        teardownInputEngine()
+        if isWarmReady {
+            return
+        }
+
+        shutdown(removeRecording: true)
+
+        let newEngine = AVAudioEngine()
+
+        // Instantiate the output graph without accessing inputNode. Keeping the
+        // mixer at zero is explicit: ACTIVE standby must not emit audible sound.
+        let mixer = newEngine.mainMixerNode
+        mixer.outputVolume = 0
+        _ = newEngine.outputNode
+
+        newEngine.prepare()
+        try newEngine.start()
+
+        guard newEngine.isRunning else {
+            newEngine.stop()
+            newEngine.reset()
+            throw MicrophoneCaptureError.serviceUnavailable
+        }
+
+        engine = newEngine
         servicePrepared = true
     }
 
-    /// Service-idle timeout. Unlike the previous implementation this timer is
-    /// not driven by discarded microphone buffers. The background audio service
-    /// keeps the process eligible to run while ACTIVE.
+    /// Service-idle timeout. If the engine truly supplies background execution,
+    /// this task continues to be serviced while ACTIVE. A generation token
+    /// prevents an older expiry from tearing down a newer service session.
     func setStandbyExpiry(after seconds: TimeInterval) {
         clearStandbyExpiry()
 
-        guard servicePrepared,
+        guard isWarmReady,
               !isRecording,
               seconds > 0 else {
             return
@@ -101,7 +132,7 @@ final class MicrophoneCapture {
 
             guard let self,
                   self.standbyGeneration == generation,
-                  self.servicePrepared,
+                  self.isWarmReady,
                   !self.isRecording else {
                 return
             }
@@ -116,15 +147,17 @@ final class MicrophoneCapture {
         standbyTask = nil
     }
 
-    /// Open microphone IO only for the actual dictation.
+    /// Start microphone capture on the already-running service engine.
     ///
-    /// The AVAudioSession is already active from the foreground-prepared service.
-    /// If iOS still rejects starting input from the background, the caller reports
-    /// audioStartFailed and the keyboard falls back to the foreground handoff.
+    /// No AVAudioEngine allocation, prepare(), start(), AudioSession activation,
+    /// or category mutation happens on this hot/background path. We only install
+    /// an input tap on the SAME engine that was started in foreground.
     func startRecording(
         firstBufferTimeout: Duration = .milliseconds(650)
     ) async throws -> URL {
-        guard servicePrepared else {
+        guard servicePrepared,
+              let engine,
+              engine.isRunning else {
             throw MicrophoneCaptureError.warmStandbyUnavailable
         }
 
@@ -133,10 +166,11 @@ final class MicrophoneCapture {
         }
 
         clearStandbyExpiry()
-        teardownInputEngine()
+        removeInputTapKeepingService()
 
-        let newEngine = AVAudioEngine()
-        let input = newEngine.inputNode
+        // inputNode is intentionally first touched here, at the moment the user
+        // explicitly asks to record.
+        let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
 
         guard format.sampleRate > 0, format.channelCount > 0 else {
@@ -167,42 +201,31 @@ final class MicrophoneCapture {
         ) { [weak self] buffer, _ in
             self?.consume(buffer)
         }
-        tapInstalled = true
+        inputTapInstalled = true
 
-        newEngine.prepare()
-
-        do {
-            try newEngine.start()
-            engine = newEngine
-        } catch {
-            input.removeTap(onBus: 0)
-            tapInstalled = false
-            engine = nil
-
-            lock.lock()
-            recordingFile = nil
-            recordingURL = nil
-            receivedRecordingBuffer = false
-            lock.unlock()
-
-            try? FileManager.default.removeItem(at: url)
-            throw error
-        }
-
+        // The engine is intentionally NOT restarted here. If installing an input
+        // tap on a foreground-started running engine is accepted by iOS, audio
+        // should begin flowing immediately.
         let startedAt = ContinuousClock.now
         while !hasReceivedRecordingBuffer {
+            if !engine.isRunning {
+                discardRecording()
+                throw MicrophoneCaptureError.serviceUnavailable
+            }
+
             if ContinuousClock.now - startedAt >= firstBufferTimeout {
                 discardRecording()
                 throw MicrophoneCaptureError.noAudioFlow
             }
+
             try await Task.sleep(for: .milliseconds(20))
         }
 
         return url
     }
 
-    /// Finish this recording and immediately release microphone input while
-    /// keeping the ACTIVE service prepared for the next keyboard activation.
+    /// Finish one dictation: close the file and remove only microphone input.
+    /// The long-lived engine remains running and returns to ACTIVE standby.
     func finishRecording() -> URL? {
         lock.lock()
         let url = recordingURL
@@ -211,11 +234,11 @@ final class MicrophoneCapture {
         receivedRecordingBuffer = false
         lock.unlock()
 
-        teardownInputEngine()
+        removeInputTapKeepingService()
         return url
     }
 
-    /// Cancel this recording, release microphone input, but keep ACTIVE service.
+    /// Cancel one dictation: remove microphone input but keep the service engine.
     func discardRecording() {
         lock.lock()
         let url = recordingURL
@@ -224,14 +247,15 @@ final class MicrophoneCapture {
         receivedRecordingBuffer = false
         lock.unlock()
 
-        teardownInputEngine()
+        removeInputTapKeepingService()
 
         if let url {
             try? FileManager.default.removeItem(at: url)
         }
     }
 
-    /// Fully release both microphone input and the prepared service state.
+    /// Fully release the ACTIVE service. This is the only normal lifecycle path
+    /// that stops and destroys the long-lived AVAudioEngine.
     func shutdown(removeRecording: Bool = true) {
         clearStandbyExpiry()
 
@@ -242,7 +266,16 @@ final class MicrophoneCapture {
         receivedRecordingBuffer = false
         lock.unlock()
 
-        teardownInputEngine()
+        removeInputTapKeepingService()
+
+        if let engine {
+            if engine.isRunning {
+                engine.stop()
+            }
+            engine.reset()
+        }
+
+        self.engine = nil
         servicePrepared = false
 
         if removeRecording, let url {
@@ -265,23 +298,15 @@ final class MicrophoneCapture {
         lock.unlock()
     }
 
-    private func teardownInputEngine() {
-        guard let engine else {
-            tapInstalled = false
-            return
-        }
+    /// Remove microphone capture without touching engine.start()/stop().
+    private func removeInputTapKeepingService() {
+        guard inputTapInstalled else { return }
 
-        if tapInstalled {
+        if let engine {
             engine.inputNode.removeTap(onBus: 0)
         }
 
-        if engine.isRunning {
-            engine.stop()
-        }
-
-        engine.reset()
-        tapInstalled = false
-        self.engine = nil
+        inputTapInstalled = false
     }
 }
 
@@ -290,6 +315,7 @@ enum MicrophoneCaptureError: LocalizedError {
     case inputUnavailable
     case warmStandbyUnavailable
     case noAudioFlow
+    case serviceUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -298,9 +324,11 @@ enum MicrophoneCaptureError: LocalizedError {
         case .inputUnavailable:
             return "The microphone input is unavailable."
         case .warmStandbyUnavailable:
-            return "The voice service is no longer active. Open TypeVoice to reactivate it."
+            return "The ACTIVE voice service is no longer running. Open TypeVoice to reactivate it."
         case .noAudioFlow:
-            return "The microphone started but no audio arrived."
+            return "The existing audio service stayed active, but microphone input produced no audio."
+        case .serviceUnavailable:
+            return "The ACTIVE AVAudioEngine service stopped unexpectedly."
         }
     }
 }
