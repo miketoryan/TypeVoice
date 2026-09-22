@@ -58,7 +58,9 @@ final class KeyboardViewController: UIInputViewController {
 
     private var pollingTask: Task<Void, Never>?
     private var commandTask: Task<Void, Never>?
+    private var activationProbeTask: Task<Void, Never>?
     private var hostResolveTask: Task<Void, Never>?
+    private var foregroundFallbackRequestID: String?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -87,6 +89,8 @@ final class KeyboardViewController: UIInputViewController {
         mayAutoInsert = false
         insertionScheduledForRequestID = nil
         stopBridgeTasks()
+        activationProbeTask?.cancel()
+        activationProbeTask = nil
         darwinObservations.removeAll()
         hostResolveTask?.cancel()
         hostResolveTask = nil
@@ -103,6 +107,7 @@ final class KeyboardViewController: UIInputViewController {
         }
         pollingTask?.cancel()
         commandTask?.cancel()
+        activationProbeTask?.cancel()
         hostResolveTask?.cancel()
         darwinObservations.removeAll()
     }
@@ -444,7 +449,14 @@ final class KeyboardViewController: UIInputViewController {
                     return
                 } catch {
                     guard attempt == 0 else {
-                        self.applyConnectionFailure()
+                        if action == .startRecording,
+                           let requestID {
+                            self.launchTypeVoiceAndResumeRecording(
+                                requestID: requestID
+                            )
+                        } else {
+                            self.applyConnectionFailure()
+                        }
                         return
                     }
                 }
@@ -452,40 +464,69 @@ final class KeyboardViewController: UIInputViewController {
         }
     }
 
+    /// Typeless-style activation gate: never trust a cached "ready" label.
+    /// Probe the containing app immediately before every direct start. If the
+    /// service cannot answer quickly, foreground TypeVoice instead.
     private func startRecordingRequest(
         requestID suppliedRequestID: String? = nil
     ) {
-        guard latestState.serviceReady,
-              latestState.backgroundWakeReady else {
-            launchTypeVoiceAndResumeRecording()
-            return
-        }
-
         let requestID = suppliedRequestID ?? UUID().uuidString
-        currentRequestID = requestID
-        mayAutoInsert = true
-        insertionScheduledForRequestID = nil
 
-        latestState = BridgeState(
-            serverID: latestState.serverID,
-            revision: latestState.revision &+ 1,
-            serviceReady: latestState.serviceReady,
-            quickDictationEnabled: latestState.quickDictationEnabled,
-            backgroundWakeReady: latestState.backgroundWakeReady,
-            microphoneReady: latestState.microphoneReady,
-            requestClaimed: false,
-            status: .starting,
-            failureKind: nil,
-            retryAvailable: false,
-            requestID: requestID,
-            transcribedText: nil,
-            resultCreatedAt: nil,
-            lastError: nil,
-            interfaceLanguage: latestState.interfaceLanguage
-        )
+        activationProbeTask?.cancel()
+        activationProbeTask = Task { @MainActor [weak self] in
+            guard let self else { return }
 
-        refreshUI()
-        sendCommand(.startRecording, requestID: requestID)
+            do {
+                let liveState = try await self.bridge.fetchState(
+                    timeoutInterval: 0.30
+                )
+                self.apply(liveState)
+
+                guard liveState.serviceReady,
+                      liveState.backgroundWakeReady else {
+                    self.launchTypeVoiceAndResumeRecording(
+                        requestID: requestID
+                    )
+                    return
+                }
+            } catch {
+                self.launchTypeVoiceAndResumeRecording(
+                    requestID: requestID
+                )
+                return
+            }
+
+            guard self.pendingForegroundRecordingRequestID == nil else {
+                return
+            }
+
+            self.currentRequestID = requestID
+            self.mayAutoInsert = true
+            self.insertionScheduledForRequestID = nil
+            self.foregroundFallbackRequestID = nil
+
+            self.latestState = BridgeState(
+                serverID: self.latestState.serverID,
+                revision: self.latestState.revision &+ 1,
+                serviceReady: self.latestState.serviceReady,
+                quickDictationEnabled: self.latestState.quickDictationEnabled,
+                backgroundWakeReady: self.latestState.backgroundWakeReady,
+                microphoneReady: false,
+                requestClaimed: false,
+                audioStage: .claimed,
+                status: .starting,
+                failureKind: nil,
+                retryAvailable: false,
+                requestID: requestID,
+                transcribedText: nil,
+                resultCreatedAt: nil,
+                lastError: nil,
+                interfaceLanguage: self.latestState.interfaceLanguage
+            )
+
+            self.refreshUI()
+            self.sendCommand(.startRecording, requestID: requestID)
+        }
     }
 
     private func apply(_ state: BridgeState) {
@@ -497,6 +538,21 @@ final class KeyboardViewController: UIInputViewController {
         }
 
         latestState = state
+
+        // If the ACTIVE service answered the probe but iOS rejected opening
+        // microphone input from background, recover automatically with the same
+        // request ID. The containing app can then start input while foregrounded
+        // and jump back without requiring a second user tap.
+        if state.status == .error,
+           state.failureKind == .audioStartFailed,
+           let requestID = state.requestID,
+           requestID == currentRequestID,
+           pendingForegroundRecordingRequestID == nil,
+           foregroundFallbackRequestID != requestID {
+            foregroundFallbackRequestID = requestID
+            launchTypeVoiceAndResumeRecording(requestID: requestID)
+            return
+        }
 
         if let pendingRequestID = pendingForegroundRecordingRequestID {
             if state.status == .recording,
@@ -534,6 +590,7 @@ final class KeyboardViewController: UIInputViewController {
             currentRequestID = nil
             mayAutoInsert = false
             insertionScheduledForRequestID = nil
+            foregroundFallbackRequestID = nil
         }
 
         if state.status == .completed,
@@ -749,10 +806,13 @@ final class KeyboardViewController: UIInputViewController {
         spaceButton.setTitle(localized("空格", "Space"), for: .normal)
     }
 
-    private func launchTypeVoiceAndResumeRecording() {
+    private func launchTypeVoiceAndResumeRecording(
+        requestID suppliedRequestID: String? = nil
+    ) {
         guard pendingForegroundRecordingRequestID == nil else { return }
 
-        let requestID = UUID().uuidString
+        let requestID = suppliedRequestID ?? UUID().uuidString
+        foregroundFallbackRequestID = requestID
         currentRequestID = requestID
         mayAutoInsert = true
         insertionScheduledForRequestID = nil
