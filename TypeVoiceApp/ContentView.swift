@@ -6,8 +6,8 @@ struct ContentView: View {
     @AppStorage(SharedKeys.interfaceLanguage, store: SharedStore.defaults)
     private var languageRaw = TypeVoiceLanguage.chinese.rawValue
 
-    @AppStorage(SharedKeys.quickStandbySeconds, store: SharedStore.defaults)
-    private var quickStandbySeconds = 60
+    @AppStorage(SharedKeys.serviceStandbySeconds, store: SharedStore.defaults)
+    private var quickStandbySeconds = 43_200
 
     private var isChinese: Bool {
         languageRaw != TypeVoiceLanguage.english.rawValue
@@ -106,8 +106,8 @@ struct ContentView: View {
                     Text(text("语音服务", "Voice service"))
                 } footer: {
                     Text(text(
-                        "快速语音采用后台麦克风热启动：只要 TypeVoice 键盘还显示在屏幕上，就不会开始后台待命倒计时。只有退出/收起 TypeVoice 键盘后，才从那一刻开始计算你设置的 10 秒、30 秒、1 分钟或 5 分钟；到期后自动关闭麦克风。之后再次从键盘使用时，允许短暂跳转 TypeVoice 激活后再返回输入框。",
-                        "Quick Dictation uses a warm background microphone. The standby countdown does not run while the TypeVoice keyboard is visible. It starts only when the TypeVoice keyboard is dismissed or exited, using the selected 10 seconds, 30 seconds, 1 minute, or 5 minutes. When that window expires, the microphone turns off. The next use may briefly open TypeVoice to reactivate it and return."
+                        "快速语音现在采用 ACTIVE 语音服务待命：待命时不保持麦克风输入，只有真正开始说话时才开启麦克风。键盘每次都会先确认后台服务是否仍能响应；如果服务不可用或 iOS 拒绝后台开启输入，会自动短暂打开 TypeVoice 恢复后再返回输入框。",
+                        "Quick Dictation now keeps an ACTIVE voice service ready without holding microphone input open. The microphone is opened only for an actual dictation. Every keyboard activation verifies that the service still responds; if it is unavailable or iOS rejects background input, TypeVoice briefly opens to recover and returns automatically."
                     ))
                 }
 
@@ -117,11 +117,11 @@ struct ContentView: View {
                         Text("English").tag(TypeVoiceLanguage.english.rawValue)
                     }
 
-                    Picker(text("退出键盘后的热待命时间", "Warm time after leaving keyboard"), selection: $quickStandbySeconds) {
-                        Text(text("10 秒", "10 seconds")).tag(10)
-                        Text(text("30 秒", "30 seconds")).tag(30)
-                        Text(text("1 分钟", "1 minute")).tag(60)
+                    Picker(text("语音服务待命时间", "Voice service standby"), selection: $quickStandbySeconds) {
                         Text(text("5 分钟", "5 minutes")).tag(300)
+                        Text(text("1 小时", "1 hour")).tag(3_600)
+                        Text(text("12 小时", "12 hours")).tag(43_200)
+                        Text(text("不自动关闭", "Never")).tag(-1)
                     }
                     .onChange(of: quickStandbySeconds) { _ in
                         model.updateStandbyDuration()
@@ -205,8 +205,8 @@ struct ContentView: View {
 
         if !model.isQuickDictationEnabled {
             return text(
-                "开启后，键盘可使用热待命语音输入。",
-                "Enable Quick Dictation to use warm voice input from the keyboard."
+                "开启后，后台语音服务保持待命，麦克风只在说话时开启。",
+                "Enable Quick Dictation to keep the voice service ready; the microphone opens only while you speak."
             )
         }
 
@@ -217,13 +217,13 @@ struct ContentView: View {
             return text("完成后会自动插入当前输入框。", "The result will be inserted automatically.")
         case .ready:
             return text(
-                "麦克风已热启动；退出 TypeVoice 键盘后才开始计算热待命时间。",
-                "Microphone warm standby is active; the timer starts only after leaving the TypeVoice keyboard."
+                "语音服务已待命；当前没有录音时麦克风保持关闭。",
+                "Voice service is ready; the microphone stays off while you are not recording."
             )
         case .idle:
             return text(
-                "快速语音仍然开启，但麦克风已释放；下次从键盘使用时会短暂打开 TypeVoice 重新激活。",
-                "Quick Dictation is still enabled, but the microphone is released. The next keyboard use may briefly open TypeVoice to reactivate it."
+                "快速语音仍然开启，但后台服务已结束；下次从键盘使用时会短暂打开 TypeVoice 重新激活。",
+                "Quick Dictation is still enabled, but the background service has ended. The next keyboard use may briefly open TypeVoice to reactivate it."
             )
         default:
             return text("快速语音已开启。", "Quick Dictation is enabled.")
