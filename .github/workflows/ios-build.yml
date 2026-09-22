@@ -89,17 +89,17 @@ jobs:
           ditto "$APP_PATH" "$PACKAGE_ROOT/Payload/TypeVoice.app"
 
           cd "$PACKAGE_ROOT"
-          ditto -c -k --sequesterRsrc --keepParent Payload TypeVoice-v0.26-AltServer.ipa
+          ditto -c -k --sequesterRsrc --keepParent Payload TypeVoice-v0.26.1-AltServer.ipa
 
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          mv TypeVoice-v0.26-AltServer.ipa "$GITHUB_WORKSPACE/artifacts/TypeVoice-v0.26-AltServer.ipa"
+          mv TypeVoice-v0.26.1-AltServer.ipa "$GITHUB_WORKSPACE/artifacts/TypeVoice-v0.26.1-AltServer.ipa"
 
-          /usr/bin/unzip -t "$GITHUB_WORKSPACE/artifacts/TypeVoice-v0.26-AltServer.ipa"
+          /usr/bin/unzip -t "$GITHUB_WORKSPACE/artifacts/TypeVoice-v0.26.1-AltServer.ipa"
 
       - name: Upload AltServer IPA
         uses: actions/upload-artifact@v4
         with:
-          name: TypeVoice-v0.26-AltServer
-          path: artifacts/TypeVoice-v0.26-AltServer.ipa
+          name: TypeVoice-v0.26.1-AltServer
+          path: artifacts/TypeVoice-v0.26.1-AltServer.ipa
           retention-days: 7
           if-no-files-found: error
