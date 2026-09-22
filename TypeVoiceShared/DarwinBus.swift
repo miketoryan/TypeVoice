@@ -6,6 +6,8 @@ enum DarwinEvent: String {
     // because TypeVoice's AltServer/free-signing path cannot rely on App Groups.
     case keyboardVisible = "com.miketoryan.typevoice.keyboardVisible"
     case keyboardHidden = "com.miketoryan.typevoice.keyboardHidden"
+    case pingMainApp = "com.miketoryan.typevoice.pingMainApp"
+    case mainAppPong = "com.miketoryan.typevoice.mainAppPong"
     case startRecording = "com.miketoryan.typevoice.startRecording"
     case stopRecording = "com.miketoryan.typevoice.stopRecording"
     case cancelRecording = "com.miketoryan.typevoice.cancelRecording"
