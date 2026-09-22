@@ -172,8 +172,8 @@ final class KeyboardViewController: UIInputViewController {
 
         default:
             // VoiceKing v0.3.9 rule:
-            // warm microphone -> record in-place;
-            // cold/unavailable microphone -> foreground TypeVoice immediately.
+            // ACTIVE service -> record in-place after a live probe;
+            // unavailable service -> foreground TypeVoice immediately.
             if latestState.serviceReady,
                latestState.backgroundWakeReady {
                 startRecordingRequest()
@@ -701,13 +701,13 @@ final class KeyboardViewController: UIInputViewController {
                       latestState.backgroundWakeReady,
                       bridgeLeaseIsFresh {
                 statusLabel.text = localized(
-                    "麦克风热待命 · 点击直接说话",
-                    "Microphone warm · tap to speak"
+                    "语音服务已待命 · 点击直接说话",
+                    "Voice service ready · tap to speak"
                 )
             } else {
                 statusLabel.text = localized(
-                    "麦克风冷待命 · 点击自动打开 TypeVoice",
-                    "Microphone cold · tap to open TypeVoice automatically"
+                    "语音服务未激活 · 点击自动打开 TypeVoice",
+                    "Voice service inactive · tap to open TypeVoice automatically"
                 )
             }
             micButton.setTitle(
