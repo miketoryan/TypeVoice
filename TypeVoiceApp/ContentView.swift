@@ -150,6 +150,21 @@ struct ContentView: View {
                 }
 
                 Section {
+                    HStack {
+                        Text(text("测试版本", "Test build"))
+                        Spacer()
+                        Text(versionBuildText)
+                            .foregroundColor(.secondary)
+                            .monospacedDigit()
+                    }
+                } footer: {
+                    Text(text(
+                        "后续测试以这里显示的 Version / Build 为准，不再用桌面小圆点判断是否更新成功。",
+                        "Use the Version / Build shown here to confirm the installed test build."
+                    ))
+                }
+
+                Section {
                     VStack(alignment: .leading, spacing: 8) {
                         Text(text("使用步骤", "Setup"))
                             .font(.headline)
@@ -165,6 +180,16 @@ struct ContentView: View {
             }
             .navigationTitle("TypeVoice")
         }
+    }
+
+    private var versionBuildText: String {
+        let version = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String ?? "?"
+        let build = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleVersion"
+        ) as? String ?? "?"
+        return "\(version) (\(build))"
     }
 
     private func text(_ zh: String, _ en: String) -> String {
