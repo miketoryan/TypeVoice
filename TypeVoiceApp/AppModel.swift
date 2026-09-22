@@ -386,7 +386,7 @@ final class AppModel: ObservableObject {
             if let hostBundleID = pending.hostBundleID,
                !hostBundleID.isEmpty {
                 try? await Task.sleep(
-                    for: audioReady ? .milliseconds(220) : .milliseconds(320)
+                    for: audioReady ? .milliseconds(120) : .milliseconds(260)
                 )
                 _ = PreviousAppReturner.open(bundleID: hostBundleID)
             }
