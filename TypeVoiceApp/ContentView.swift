@@ -18,6 +18,21 @@ struct ContentView: View {
             Form {
                 Section {
                     HStack {
+                        Text(text("测试版本", "Test build"))
+                        Spacer()
+                        Text(versionBuildText)
+                            .foregroundColor(.secondary)
+                            .monospacedDigit()
+                    }
+                } footer: {
+                    Text(text(
+                        "后续测试以这里显示的 Version / Build 为准，不再用桌面小圆点判断是否更新成功。",
+                        "Use the Version / Build shown here to confirm the installed test build."
+                    ))
+                }
+
+                Section {
+                    HStack {
                         Text(text("账号", "Account"))
                         Spacer()
                         Text(
@@ -147,21 +162,6 @@ struct ContentView: View {
                         Text(error)
                             .foregroundColor(.red)
                     }
-                }
-
-                Section {
-                    HStack {
-                        Text(text("测试版本", "Test build"))
-                        Spacer()
-                        Text(versionBuildText)
-                            .foregroundColor(.secondary)
-                            .monospacedDigit()
-                    }
-                } footer: {
-                    Text(text(
-                        "后续测试以这里显示的 Version / Build 为准，不再用桌面小圆点判断是否更新成功。",
-                        "Use the Version / Build shown here to confirm the installed test build."
-                    ))
                 }
 
                 Section {
