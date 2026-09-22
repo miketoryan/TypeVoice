@@ -49,8 +49,7 @@ final class KeyboardViewController: UIInputViewController {
     private var mayAutoInsert = false
     private var insertionScheduledForRequestID: String?
     private var hostBundleID: String?
-    private var foregroundHandoffPending = false
-    private var pendingForegroundRecordingRequestID: String?
+    private var pendingAutoRecordingAfterLaunch = false
     private var lastBridgeSuccessAt: Date?
     private var darwinObservations: [DarwinObservation] = []
 
@@ -59,6 +58,7 @@ final class KeyboardViewController: UIInputViewController {
     private var pollingTask: Task<Void, Never>?
     private var commandTask: Task<Void, Never>?
     private var hostResolveTask: Task<Void, Never>?
+    private var foregroundFallbackRequestID: String?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -69,7 +69,7 @@ final class KeyboardViewController: UIInputViewController {
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         keyboardVisible = true
-        foregroundHandoffPending = false
+        if currentRequestID != nil { mayAutoInsert = true }
         hostBundleID = hostBundleID ?? HostApplicationResolver.lastCaptured
 
         DarwinBus.post(.keyboardVisible)
@@ -80,7 +80,7 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     override func viewWillDisappear(_ animated: Bool) {
-        if keyboardVisible && !foregroundHandoffPending {
+        if keyboardVisible {
             DarwinBus.post(.keyboardHidden)
         }
         keyboardVisible = false
@@ -88,17 +88,11 @@ final class KeyboardViewController: UIInputViewController {
         insertionScheduledForRequestID = nil
         stopBridgeTasks()
         darwinObservations.removeAll()
-        hostResolveTask?.cancel()
-        hostResolveTask = nil
-        if !foregroundHandoffPending {
-            HostApplicationResolver.invalidate()
-            hostBundleID = nil
-        }
         super.viewWillDisappear(animated)
     }
 
     deinit {
-        if keyboardVisible && !foregroundHandoffPending {
+        if keyboardVisible {
             DarwinBus.post(.keyboardHidden)
         }
         pollingTask?.cancel()
@@ -123,7 +117,7 @@ final class KeyboardViewController: UIInputViewController {
             return
         }
 
-        if pendingForegroundRecordingRequestID != nil {
+        if pendingAutoRecordingAfterLaunch {
             return
         }
 
@@ -143,7 +137,7 @@ final class KeyboardViewController: UIInputViewController {
 
         case .starting:
             // A hot-path start can still be cancelled. A cold foreground handoff
-            // is tracked separately by pendingForegroundRecordingRequestID.
+            // is tracked separately by pendingAutoRecordingAfterLaunch.
             sendCommand(
                 .cancelRecording,
                 requestID: latestState.requestID ?? currentRequestID
@@ -158,20 +152,18 @@ final class KeyboardViewController: UIInputViewController {
                 )
             } else if latestState.failureKind == .authRequired {
                 openTypeVoiceForAccountRecovery()
-            } else if latestState.serviceReady,
-                      latestState.backgroundWakeReady {
-                startRecordingRequest()
+            } else if warmServiceIsUsable {
+                startWarmRecordingRequest()
             } else {
                 launchTypeVoiceAndResumeRecording()
             }
 
         default:
-            // VoiceKing v0.3.9 rule:
-            // warm microphone -> record in-place;
-            // cold/unavailable microphone -> foreground TypeVoice immediately.
-            if latestState.serviceReady,
-               latestState.backgroundWakeReady {
-                startRecordingRequest()
+            // During the configured short microphone standby window, the main app
+            // is genuinely alive because microphone IO is still running. Start
+            // directly with no Ping/Pong delay. Outside that window, jump first.
+            if warmServiceIsUsable {
+                startWarmRecordingRequest()
             } else {
                 launchTypeVoiceAndResumeRecording()
             }
@@ -444,7 +436,14 @@ final class KeyboardViewController: UIInputViewController {
                     return
                 } catch {
                     guard attempt == 0 else {
-                        self.applyConnectionFailure()
+                        if action == .startRecording,
+                           let requestID {
+                            self.launchTypeVoiceAndResumeRecording(
+                                requestID: requestID
+                            )
+                        } else {
+                            self.applyConnectionFailure()
+                        }
                         return
                     }
                 }
@@ -452,19 +451,23 @@ final class KeyboardViewController: UIInputViewController {
         }
     }
 
-    private func startRecordingRequest(
+    private var warmServiceIsUsable: Bool {
+        latestState.serviceReady
+            && latestState.backgroundWakeReady
+            && latestState.microphoneReady
+            && bridgeLeaseIsFresh
+    }
+
+    private func startWarmRecordingRequest(
         requestID suppliedRequestID: String? = nil
     ) {
-        guard latestState.serviceReady,
-              latestState.backgroundWakeReady else {
-            launchTypeVoiceAndResumeRecording()
-            return
-        }
+        guard !pendingAutoRecordingAfterLaunch else { return }
 
         let requestID = suppliedRequestID ?? UUID().uuidString
         currentRequestID = requestID
         mayAutoInsert = true
         insertionScheduledForRequestID = nil
+        foregroundFallbackRequestID = nil
 
         latestState = BridgeState(
             serverID: latestState.serverID,
@@ -474,6 +477,7 @@ final class KeyboardViewController: UIInputViewController {
             backgroundWakeReady: latestState.backgroundWakeReady,
             microphoneReady: latestState.microphoneReady,
             requestClaimed: false,
+            audioStage: .claimed,
             status: .starting,
             failureKind: nil,
             retryAvailable: false,
@@ -498,20 +502,39 @@ final class KeyboardViewController: UIInputViewController {
 
         latestState = state
 
-        if let pendingRequestID = pendingForegroundRecordingRequestID {
+        // If the ACTIVE service answered the probe but iOS rejected opening
+        // microphone input from background, recover automatically with the same
+        // request ID. The containing app can then start input while foregrounded
+        // and jump back without requiring a second user tap.
+        if state.status == .error,
+           (state.failureKind == .audioStartFailed
+                || state.failureKind == .bridgeUnavailable),
+           let requestID = state.requestID,
+           requestID == currentRequestID,
+           !pendingAutoRecordingAfterLaunch,
+           foregroundFallbackRequestID != requestID {
+            foregroundFallbackRequestID = requestID
+            launchTypeVoiceAndResumeRecording(requestID: requestID)
+            return
+        }
+
+        if pendingAutoRecordingAfterLaunch,
+           state.serviceReady {
             if state.status == .recording,
-               state.requestID == pendingRequestID {
-                pendingForegroundRecordingRequestID = nil
+               let requestID = state.requestID,
+               requestID == currentRequestID {
+                pendingAutoRecordingAfterLaunch = false
+                foregroundFallbackRequestID = nil
                 mayAutoInsert = true
             } else if state.status == .idle,
-                      state.serviceReady,
-                      state.backgroundWakeReady {
-                pendingForegroundRecordingRequestID = nil
-                startRecordingRequest(requestID: pendingRequestID)
+                      state.microphoneReady,
+                      let requestID = currentRequestID {
+                pendingAutoRecordingAfterLaunch = false
+                startWarmRecordingRequest(requestID: requestID)
                 return
             } else if state.status == .error,
-                      state.requestID == pendingRequestID {
-                pendingForegroundRecordingRequestID = nil
+                      state.requestID == currentRequestID {
+                pendingAutoRecordingAfterLaunch = false
             }
         }
 
@@ -534,6 +557,7 @@ final class KeyboardViewController: UIInputViewController {
             currentRequestID = nil
             mayAutoInsert = false
             insertionScheduledForRequestID = nil
+            foregroundFallbackRequestID = nil
         }
 
         if state.status == .completed,
@@ -553,8 +577,8 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func applyConnectionFailure() {
-        // Like VocaPhone's readiness lease: one missed local request is not
-        // enough to declare a warm background service dead.
+        // UI polling is only for state/result delivery. New recordings use the
+        // deterministic foreground handoff, so one missed poll must not disturb UI.
         if bridgeLeaseIsFresh {
             return
         }
@@ -565,7 +589,7 @@ final class KeyboardViewController: UIInputViewController {
             return
         }
 
-        pendingForegroundRecordingRequestID = nil
+        pendingAutoRecordingAfterLaunch = false
         currentRequestID = nil
         mayAutoInsert = false
         insertionScheduledForRequestID = nil
@@ -601,7 +625,7 @@ final class KeyboardViewController: UIInputViewController {
             return
         }
 
-        if pendingForegroundRecordingRequestID != nil {
+        if pendingAutoRecordingAfterLaunch {
             statusLabel.text = localized(
                 "正在启动 TypeVoice 并打开麦克风…",
                 "Opening TypeVoice and starting the microphone…"
@@ -640,17 +664,10 @@ final class KeyboardViewController: UIInputViewController {
                     "快速语音未开启 · 点击会打开 TypeVoice",
                     "Quick Dictation is off · tap to open TypeVoice"
                 )
-            } else if latestState.serviceReady,
-                      latestState.backgroundWakeReady,
-                      bridgeLeaseIsFresh {
-                statusLabel.text = localized(
-                    "麦克风热待命 · 点击直接说话",
-                    "Microphone warm · tap to speak"
-                )
             } else {
                 statusLabel.text = localized(
-                    "麦克风冷待命 · 点击自动打开 TypeVoice",
-                    "Microphone cold · tap to open TypeVoice automatically"
+                    "点击后短暂打开 TypeVoice 并自动返回",
+                    "Tap to briefly open TypeVoice and return automatically"
                 )
             }
             micButton.setTitle(
@@ -749,18 +766,21 @@ final class KeyboardViewController: UIInputViewController {
         spaceButton.setTitle(localized("空格", "Space"), for: .normal)
     }
 
-    private func launchTypeVoiceAndResumeRecording() {
-        guard pendingForegroundRecordingRequestID == nil else { return }
+    private func launchTypeVoiceAndResumeRecording(
+        requestID suppliedRequestID: String? = nil
+    ) {
+        guard !pendingAutoRecordingAfterLaunch else { return }
 
-        let requestID = UUID().uuidString
+        let requestID = suppliedRequestID ?? UUID().uuidString
         currentRequestID = requestID
         mayAutoInsert = true
         insertionScheduledForRequestID = nil
-        pendingForegroundRecordingRequestID = requestID
+        foregroundFallbackRequestID = requestID
+        pendingAutoRecordingAfterLaunch = true
 
         statusLabel.text = localized(
-            "正在启动 TypeVoice…",
-            "Opening TypeVoice…"
+            "正在唤醒 TypeVoice…",
+            "Waking TypeVoice…"
         )
         micButton.setTitle(
             localized("正在打开…", "Opening…"),
@@ -782,19 +802,7 @@ final class KeyboardViewController: UIInputViewController {
             guard let self else { return }
             let resolved = await self.resolveHostBundleIdentifier()
             guard !Task.isCancelled,
-                  self.pendingForegroundRecordingRequestID == requestID else {
-                return
-            }
-
-            guard let resolved else {
-                self.pendingForegroundRecordingRequestID = nil
-                self.currentRequestID = nil
-                self.mayAutoInsert = false
-                self.statusLabel.text = self.localized(
-                    "无法识别当前输入 App，请切换一次键盘后重试",
-                    "Could not identify the current app. Switch keyboards once and try again."
-                )
-                self.refreshUI()
+                  self.pendingAutoRecordingAfterLaunch else {
                 return
             }
 
@@ -806,33 +814,42 @@ final class KeyboardViewController: UIInputViewController {
         }
     }
 
+    private func clearPendingForegroundHandoff() {
+        pendingAutoRecordingAfterLaunch = false
+        currentRequestID = nil
+        mayAutoInsert = false
+        insertionScheduledForRequestID = nil
+    }
+
     private func openTypeVoice(
-        returningTo hostBundleID: String,
+        returningTo hostBundleID: String?,
         requestID: String
     ) {
         var components = URLComponents()
         components.scheme = "typevoice"
-        components.host = "prepare"
+        components.host = "start-recording"
         components.queryItems = [
-            URLQueryItem(name: "source", value: "keyboard"),
-            URLQueryItem(name: "autostart", value: "1"),
-            URLQueryItem(name: "request", value: requestID),
-            URLQueryItem(name: "host", value: hostBundleID)
+            URLQueryItem(name: "requestID", value: requestID)
         ]
+        if let hostBundleID, !hostBundleID.isEmpty {
+            components.queryItems?.append(
+                URLQueryItem(
+                    name: "returnBundleIdentifier",
+                    value: hostBundleID
+                )
+            )
+        }
 
         guard let url = components.url else {
-            pendingForegroundRecordingRequestID = nil
+            pendingAutoRecordingAfterLaunch = false
             refreshUI()
             return
         }
 
-        // VoiceKing v0.3.9 rule: one normal keyboard button initiates the
-        // foreground handoff. SwiftUI openURL performs the primary launch.
-        foregroundHandoffPending = true
+        // Direct transplant of VoiceKing 0.4.1's keyboard handoff:
+        // supported SwiftUI openURL first, one responder-chain fallback at 600ms.
         urlLauncher.open(url)
 
-        // Keep VoiceKing's sideload fallback. If SwiftUI already foregrounded
-        // TypeVoice, viewWillDisappear makes keyboardVisible false and this is skipped.
         Task { @MainActor [weak self] in
             do {
                 try await Task.sleep(for: .milliseconds(600))
@@ -842,18 +859,17 @@ final class KeyboardViewController: UIInputViewController {
 
             guard let self,
                   self.keyboardVisible,
-                  self.pendingForegroundRecordingRequestID == requestID else {
+                  self.pendingAutoRecordingAfterLaunch else {
                 return
             }
 
             if !self.openURLViaResponderChain(url) {
-                self.foregroundHandoffPending = false
-                self.pendingForegroundRecordingRequestID = nil
+                self.pendingAutoRecordingAfterLaunch = false
                 self.currentRequestID = nil
                 self.mayAutoInsert = false
                 self.statusLabel.text = self.localized(
                     "无法自动打开 TypeVoice，请再点一次语音",
-                    "Could not open TypeVoice automatically. Tap the microphone again."
+                    "Could not open TypeVoice. Tap the microphone again."
                 )
                 self.refreshUI()
             }
@@ -890,7 +906,6 @@ final class KeyboardViewController: UIInputViewController {
             "正在打开 TypeVoice 重新登录…",
             "Opening TypeVoice to sign in again…"
         )
-        foregroundHandoffPending = true
         urlLauncher.open(url)
     }
 

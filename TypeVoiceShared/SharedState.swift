@@ -21,7 +21,9 @@ enum SharedKeys {
     static let interfaceLanguage = "typevoice.interfaceLanguage"
     static let quickDictationEnabled = "typevoice.quickDictationEnabled"
     static let quickStandbySeconds = "typevoice.quickStandbySeconds"
+    static let serviceStandbySeconds = "typevoice.serviceStandbySeconds.v2"
     static let cleanupModel = "typevoice.cleanupModel"
+    static let cleanupEnabled = "typevoice.cleanupEnabled"
 }
 
 enum SharedStore {
@@ -57,6 +59,31 @@ enum SharedStore {
         }
         set {
             defaults.set(newValue, forKey: SharedKeys.quickStandbySeconds)
+        }
+    }
+
+    static var serviceStandbySeconds: Int {
+        get {
+            guard defaults.object(forKey: SharedKeys.serviceStandbySeconds) != nil else {
+                return 10
+            }
+            let value = defaults.integer(forKey: SharedKeys.serviceStandbySeconds)
+            return [0, 10, 30, 60, 300].contains(value) ? value : 10
+        }
+        set {
+            defaults.set(newValue, forKey: SharedKeys.serviceStandbySeconds)
+        }
+    }
+
+    static var cleanupEnabled: Bool {
+        get {
+            guard defaults.object(forKey: SharedKeys.cleanupEnabled) != nil else {
+                return true
+            }
+            return defaults.bool(forKey: SharedKeys.cleanupEnabled)
+        }
+        set {
+            defaults.set(newValue, forKey: SharedKeys.cleanupEnabled)
         }
     }
 

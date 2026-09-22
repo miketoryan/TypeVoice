@@ -6,8 +6,11 @@ struct ContentView: View {
     @AppStorage(SharedKeys.interfaceLanguage, store: SharedStore.defaults)
     private var languageRaw = TypeVoiceLanguage.chinese.rawValue
 
-    @AppStorage(SharedKeys.quickStandbySeconds, store: SharedStore.defaults)
-    private var quickStandbySeconds = 60
+    @AppStorage(SharedKeys.serviceStandbySeconds, store: SharedStore.defaults)
+    private var standbySeconds = 10
+
+    @AppStorage(SharedKeys.cleanupEnabled, store: SharedStore.defaults)
+    private var cleanupEnabled = true
 
     private var isChinese: Bool {
         languageRaw != TypeVoiceLanguage.english.rawValue
@@ -16,6 +19,21 @@ struct ContentView: View {
     var body: some View {
         NavigationView {
             Form {
+                Section {
+                    HStack {
+                        Text(text("测试版本", "Test build"))
+                        Spacer()
+                        Text(versionBuildText)
+                            .foregroundColor(.secondary)
+                            .monospacedDigit()
+                    }
+                } footer: {
+                    Text(text(
+                        "后续测试以这里显示的 Version / Build 为准，不再用桌面小圆点判断是否更新成功。",
+                        "Use the Version / Build shown here to confirm the installed test build."
+                    ))
+                }
+
                 Section {
                     HStack {
                         Text(text("账号", "Account"))
@@ -88,13 +106,6 @@ struct ContentView: View {
                             }
                         }
 
-                        if model.isQuickDictationEnabled && !model.isServiceReady {
-                            Button {
-                                Task { await model.arm() }
-                            } label: {
-                                Text(text("立即激活麦克风", "Activate Microphone Now"))
-                            }
-                        }
                     }
                     .disabled(
                         !model.isChatGPTLoggedIn
@@ -106,8 +117,8 @@ struct ContentView: View {
                     Text(text("语音服务", "Voice service"))
                 } footer: {
                     Text(text(
-                        "快速语音采用后台麦克风热启动：只要 TypeVoice 键盘还显示在屏幕上，就不会开始后台待命倒计时。只有退出/收起 TypeVoice 键盘后，才从那一刻开始计算你设置的 10 秒、30 秒、1 分钟或 5 分钟；到期后自动关闭麦克风。之后再次从键盘使用时，允许短暂跳转 TypeVoice 激活后再返回输入框。",
-                        "Quick Dictation uses a warm background microphone. The standby countdown does not run while the TypeVoice keyboard is visible. It starts only when the TypeVoice keyboard is dismissed or exited, using the selected 10 seconds, 30 seconds, 1 minute, or 5 minutes. When that window expires, the microphone turns off. The next use may briefly open TypeVoice to reactivate it and return."
+                        "首次或待命结束后采用稳定的跳转激活：TypeVoice 短暂打开并自动返回。录音结束后，麦克风可按设置继续待命 0–5 分钟；待命期间再次录音无需跳转。",
+                        "First use, or use after standby expires, uses the stable foreground handoff and returns automatically. After recording, the microphone can remain warm for the selected 0–5 minutes; another recording during that window starts without a handoff."
                     ))
                 }
 
@@ -117,21 +128,27 @@ struct ContentView: View {
                         Text("English").tag(TypeVoiceLanguage.english.rawValue)
                     }
 
-                    Picker(text("退出键盘后的热待命时间", "Warm time after leaving keyboard"), selection: $quickStandbySeconds) {
+                    Picker(text("麦克风待命时间", "Microphone standby"), selection: $standbySeconds) {
+                        Text(text("0 秒", "0 seconds")).tag(0)
                         Text(text("10 秒", "10 seconds")).tag(10)
                         Text(text("30 秒", "30 seconds")).tag(30)
                         Text(text("1 分钟", "1 minute")).tag(60)
                         Text(text("5 分钟", "5 minutes")).tag(300)
                     }
-                    .onChange(of: quickStandbySeconds) { _ in
+                    .onChange(of: standbySeconds) { _ in
                         model.updateStandbyDuration()
                     }
+
+                    Toggle(
+                        text("语音识别后自动整理", "Auto-clean after transcription"),
+                        isOn: $cleanupEnabled
+                    )
                 } header: {
                     Text(text("使用设置", "Usage"))
                 } footer: {
                     Text(text(
-                        "这里的中文/English 只控制界面显示，不控制识别语言。语音识别自动判断中文、英文或中英混说。",
-                        "This Chinese/English option only changes the interface. Speech language is detected automatically, including mixed Chinese and English."
+                        "界面语言不影响语音识别语言。麦克风待命期间可直接再次录音；待命结束后仍使用跳转激活。自动整理默认开启，关闭后直接插入原始语音识别结果，不再调用二次整理模型。",
+                        "Interface language does not affect speech recognition. During microphone standby, another recording can start directly; after standby expires, TypeVoice uses foreground handoff. Auto-clean is on by default; when off, the raw transcription is inserted without a second cleanup model call."
                     ))
                 }
 
@@ -167,6 +184,16 @@ struct ContentView: View {
         }
     }
 
+    private var versionBuildText: String {
+        let version = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String ?? "?"
+        let build = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleVersion"
+        ) as? String ?? "?"
+        return "\(version) (\(build))"
+    }
+
     private func text(_ zh: String, _ en: String) -> String {
         isChinese ? zh : en
     }
@@ -176,13 +203,13 @@ struct ContentView: View {
             return text("未开启", "Disabled")
         }
 
-        if !model.isServiceReady, model.status == .idle {
-            return text("冷待命", "Cold standby")
+        if model.status == .idle {
+            return text("跳转待命", "Handoff ready")
         }
 
         switch model.status {
         case .idle:
-            return text("冷待命", "Cold standby")
+            return text("跳转待命", "Handoff ready")
         case .ready:
             return text("已待命", "Ready")
         case .starting:
@@ -205,8 +232,8 @@ struct ContentView: View {
 
         if !model.isQuickDictationEnabled {
             return text(
-                "开启后，键盘可使用热待命语音输入。",
-                "Enable Quick Dictation to use warm voice input from the keyboard."
+                "开启后，键盘会在每次开始录音时短暂打开 TypeVoice。",
+                "When enabled, the keyboard briefly opens TypeVoice each time a new recording starts."
             )
         }
 
@@ -217,13 +244,13 @@ struct ContentView: View {
             return text("完成后会自动插入当前输入框。", "The result will be inserted automatically.")
         case .ready:
             return text(
-                "麦克风已热启动；退出 TypeVoice 键盘后才开始计算热待命时间。",
-                "Microphone warm standby is active; the timer starts only after leaving the TypeVoice keyboard."
+                "麦克风正在短时待命；再次点击可直接录音。",
+                "Microphone is in short standby; tap again to record directly."
             )
         case .idle:
             return text(
-                "快速语音仍然开启，但麦克风已释放；下次从键盘使用时会短暂打开 TypeVoice 重新激活。",
-                "Quick Dictation is still enabled, but the microphone is released. The next keyboard use may briefly open TypeVoice to reactivate it."
+                "未录音时不保持后台音频；下次点击键盘麦克风会自动跳转、启动并返回。",
+                "No idle background audio is kept running. The next keyboard tap will hand off to TypeVoice, start capture, and return automatically."
             )
         default:
             return text("快速语音已开启。", "Quick Dictation is enabled.")

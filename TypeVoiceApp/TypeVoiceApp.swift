@@ -10,7 +10,9 @@ struct TypeVoiceApp: App {
             ContentView()
                 .environmentObject(model)
                 .onOpenURL { url in
-                    model.handleOpenURL(url)
+                    Task {
+                        await model.handleIncomingURL(url)
+                    }
                 }
                 .onChange(of: scenePhase) { newPhase in
                     switch newPhase {
